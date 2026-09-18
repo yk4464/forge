@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use forge_core::error::{Error, Result};
 use forge_core::message::Message;
-use forge_core::session::{SessionStore, SessionSummary};
+use forge_core::session::{SessionStore, SessionSummary, ToolEvent, ToolEventState};
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Pool, Row, Sqlite};
@@ -10,10 +10,11 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-/// Schema version recorded in `PRAGMA user_version`. v1 is the original
-/// shape (sessions/messages/session_meta); v0 means a database written by
-/// a build older than version stamping — same shape, just unstamped.
-pub const SCHEMA_VERSION: i32 = 1;
+/// Schema version recorded in `PRAGMA user_version`. v2 adds the
+/// tool_events recovery log; v1 is the original shape (sessions/messages/
+/// session_meta); v0 means a database written by a build older than
+/// version stamping.
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// SQLite-backed SessionStore. Messages are stored as serde-JSON of the
 /// canonical Message enum, so schema changes never lose transcripts.
@@ -83,6 +84,17 @@ CREATE TABLE IF NOT EXISTS session_meta (
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (session_id, key)
+);
+CREATE TABLE IF NOT EXISTS tool_events (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    call_id TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    arguments TEXT NOT NULL,
+    state TEXT NOT NULL,
+    output TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, call_id)
 );
 "#,
         )
@@ -253,6 +265,94 @@ impl SessionStore for SqliteSessionStore {
         Ok(())
     }
 
+    async fn record_tool_started(
+        &self,
+        session_id: Uuid,
+        call_id: &str,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO tool_events (session_id, call_id, tool, arguments, state, output, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'started', '', ?, ?) \
+             ON CONFLICT(session_id, call_id) DO UPDATE SET state = 'started', updated_at = excluded.updated_at",
+        )
+        .bind(session_id.to_string())
+        .bind(call_id)
+        .bind(tool)
+        .bind(arguments.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_tool_finished(
+        &self,
+        session_id: Uuid,
+        call_id: &str,
+        state: ToolEventState,
+        output: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        // If the started row is missing (its write failed), create the
+        // record here rather than losing the terminal state.
+        let result = sqlx::query(
+            "UPDATE tool_events SET state = ?, output = ?, updated_at = ? \
+             WHERE session_id = ? AND call_id = ?",
+        )
+        .bind(state.as_str())
+        .bind(output)
+        .bind(&now)
+        .bind(session_id.to_string())
+        .bind(call_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO tool_events (session_id, call_id, tool, arguments, state, output, created_at, updated_at) \
+                 VALUES (?, ?, '(unknown)', '{}', ?, ?, ?, ?)",
+            )
+            .bind(session_id.to_string())
+            .bind(call_id)
+            .bind(state.as_str())
+            .bind(output)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn load_tool_events(&self, session_id: Uuid) -> Result<Vec<ToolEvent>> {
+        let rows = sqlx::query(
+            "SELECT call_id, tool, arguments, state, output FROM tool_events \
+             WHERE session_id = ? ORDER BY rowid ASC",
+        )
+        .bind(session_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut events = Vec::with_capacity(rows.len());
+        for r in rows {
+            let arguments: String = r.get("arguments");
+            events.push(ToolEvent {
+                call_id: r.get("call_id"),
+                tool: r.get("tool"),
+                arguments: serde_json::from_str(&arguments).unwrap_or(Value::Null),
+                state: ToolEventState::from_str(r.get::<String, _>("state").as_str()),
+                output: r.get("output"),
+            });
+        }
+        Ok(events)
+    }
+
     async fn set_meta(&self, session_id: Uuid, key: &str, value: &Value) -> Result<()> {
         sqlx::query(
             "INSERT INTO session_meta (session_id, key, value) VALUES (?, ?, ?) \
@@ -381,6 +481,54 @@ mod tests {
     async fn fresh_open_stamps_schema_version() {
         let store = memory_store().await;
         assert_eq!(store.schema_version().await.unwrap(), SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn tool_event_lifecycle_roundtrip() {
+        let store = memory_store().await;
+        let sid = store.create_session("t").await.unwrap();
+        let args = serde_json::json!({"command": "sleep 1"});
+
+        store
+            .record_tool_started(sid, "c1", "shell", &args)
+            .await
+            .unwrap();
+        store
+            .record_tool_started(sid, "c2", "shell", &args)
+            .await
+            .unwrap();
+        let events = store.load_tool_events(sid).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.state == ToolEventState::Started));
+
+        store
+            .record_tool_finished(sid, "c1", ToolEventState::Completed, "out")
+            .await
+            .unwrap();
+        store
+            .record_tool_finished(sid, "c2", ToolEventState::Failed, "tool error: boom")
+            .await
+            .unwrap();
+        let events = store.load_tool_events(sid).await.unwrap();
+        assert_eq!(events[0].state, ToolEventState::Completed);
+        assert_eq!(events[0].output, "out");
+        assert_eq!(events[1].state, ToolEventState::Failed);
+        assert_eq!(events[1].arguments, args);
+    }
+
+    #[tokio::test]
+    async fn finished_record_survives_missing_started_row() {
+        let store = memory_store().await;
+        let sid = store.create_session("t").await.unwrap();
+        // The started write was lost: the terminal state must still land.
+        store
+            .record_tool_finished(sid, "cx", ToolEventState::Completed, "late")
+            .await
+            .unwrap();
+        let events = store.load_tool_events(sid).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].state, ToolEventState::Completed);
+        assert_eq!(events[0].output, "late");
     }
 
     #[tokio::test]

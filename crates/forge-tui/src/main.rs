@@ -438,8 +438,28 @@ async fn build_agent(
     let mut load_ok = false;
     if let Some(sid) = session_id {
         match store.load_messages(sid).await {
-            Ok(msgs) => {
+            Ok(mut msgs) => {
                 load_ok = true;
+                // Close crash gaps from the execution log BEFORE anything
+                // else: completed work is reused, interrupted calls are
+                // marked unknown and never auto-replayed (S1 恢复规则).
+                let tool_events = match store.load_tool_events(sid).await {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        tracing::warn!("tool event log unavailable: {e}");
+                        Vec::new()
+                    }
+                };
+                let unknown =
+                    forge_core::recovery::recover_unanswered_calls(&mut msgs, &tool_events);
+                if !unknown.is_empty() {
+                    warning = Some(format!(
+                        "{} tool call(s) from the previous session were interrupted; \
+                         their real-world effects are unknown and were NOT retried — \
+                         verify files/processes before continuing",
+                        unknown.len()
+                    ));
+                }
                 stored_len = msgs.len();
                 for m in msgs {
                     // Skip persisted system prompts; ours is fresh above.
@@ -565,6 +585,30 @@ mod tests {
         async fn rename_session(&self, _: uuid::Uuid, _: &str) -> forge_core::Result<()> {
             Ok(())
         }
+        async fn record_tool_started(
+            &self,
+            _: uuid::Uuid,
+            _: &str,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> forge_core::Result<()> {
+            Ok(())
+        }
+        async fn record_tool_finished(
+            &self,
+            _: uuid::Uuid,
+            _: &str,
+            _: forge_core::session::ToolEventState,
+            _: &str,
+        ) -> forge_core::Result<()> {
+            Ok(())
+        }
+        async fn load_tool_events(
+            &self,
+            _: uuid::Uuid,
+        ) -> forge_core::Result<Vec<forge_core::session::ToolEvent>> {
+            Ok(Vec::new())
+        }
         async fn set_meta(
             &self,
             _: uuid::Uuid,
@@ -652,5 +696,76 @@ mod tests {
             .unwrap();
         assert_eq!(found.map(|s| s.id), Some(sid_check));
         let _ = (sid_b,);
+    }
+
+    #[tokio::test]
+    async fn interrupted_calls_marked_unknown_not_retried() {
+        // Simulate a crash mid-tool: the transcript holds an assistant
+        // call with no result, and the execution log says the call
+        // STARTED but never finished. Recovery must record an honest
+        // unknown-state result and surface a warning — not replay it.
+        let dir = std::env::temp_dir().join(format!("forge-tui-test-{}", uuid::Uuid::new_v4()));
+        let store = SqliteSessionStore::open(&dir.join("t.db")).await.unwrap();
+        let sid = store.create_session("crashed").await.unwrap();
+        let call = forge_core::message::ToolCall {
+            id: "c1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "rm -rf build"}),
+        };
+        let call_args = call.arguments.clone();
+        store
+            .replace_messages(
+                sid,
+                &[
+                    Message::user("clean build dir"),
+                    Message::Assistant {
+                        content: String::new(),
+                        reasoning: None,
+                        tool_calls: vec![call],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .record_tool_started(sid, "c1", "shell", &call_args)
+            .await
+            .unwrap();
+
+        let cfg = Config::default();
+        let api_key = cfg.resolve_api_key().unwrap_or_default();
+        let store_dyn: Arc<dyn SessionStore> = Arc::new(store);
+        let (agent, warning) = build_agent(
+            &cfg,
+            &api_key,
+            &test_tools(),
+            &store_dyn,
+            &test_provider(),
+            Some(sid),
+        )
+        .await;
+
+        let warning = warning.expect("interrupted calls must surface a warning");
+        assert!(warning.contains("interrupted"), "got: {warning}");
+        assert!(
+            warning.contains("NOT retried"),
+            "recovery must not imply a replay: {warning}"
+        );
+
+        // History is protocol-valid and carries the unknown-state marker.
+        let msgs = agent.context.lock().await.history.snapshot();
+        let last = msgs.last().unwrap();
+        assert!(
+            matches!(last, Message::ToolResult { content, is_error: true, .. }
+                if content.contains("UNKNOWN")),
+            "expected unknown-state result, got {last:?}"
+        );
+
+        // The recovered transcript was persisted (resync rewrite).
+        let stored = store_dyn.load_messages(sid).await.unwrap();
+        assert_eq!(stored.len(), msgs.len(), "recovered rows must be persisted");
+        assert!(
+            matches!(&stored[3], Message::ToolResult { content, .. } if content.contains("UNKNOWN"))
+        );
     }
 }

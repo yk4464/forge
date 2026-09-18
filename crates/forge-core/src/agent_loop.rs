@@ -290,6 +290,8 @@ impl Agent {
                     content: refusal.clone(),
                     is_error: true,
                 });
+                self.log_tool_finished(&call.id, crate::session::ToolEventState::Failed, &refusal)
+                    .await;
                 self.persist_state(Some(events)).await;
                 send(AgentEvent::ToolCallCompleted {
                     call_id: call.id.clone(),
@@ -307,6 +309,17 @@ impl Agent {
                 command: args_json.clone(),
             });
             turn.tool_calls += 1;
+            // Execution log (S1): the started record precedes the tool, so
+            // recovery can tell "never ran" from "ran, outcome unknown".
+            if let Some(sid) = self.session_id {
+                if let Err(e) = self
+                    .store
+                    .record_tool_started(sid, &call.id, &call.name, &call.arguments)
+                    .await
+                {
+                    tracing::warn!("tool event log (started) failed: {e}");
+                }
+            }
 
             let started = std::time::Instant::now();
             let emitter = EventEmitter {
@@ -329,6 +342,15 @@ impl Agent {
 
             let (content, is_error) = match result {
                 Ok(out) => {
+                    // Terminal log state first: a crash after this point
+                    // lets recovery REUSE the recorded output instead of
+                    // guessing (S1 恢复规则: 已完成操作复用记录).
+                    self.log_tool_finished(
+                        &call.id,
+                        crate::session::ToolEventState::Completed,
+                        &out.content,
+                    )
+                    .await;
                     send(AgentEvent::ToolCallCompleted {
                         call_id: call.id.clone(),
                         exit_code: out.exit_code,
@@ -339,6 +361,12 @@ impl Agent {
                     (out.content, false)
                 }
                 Err(Error::Cancelled) => {
+                    self.log_tool_finished(
+                        &call.id,
+                        crate::session::ToolEventState::Failed,
+                        "cancelled by user",
+                    )
+                    .await;
                     send(AgentEvent::ToolCallCompleted {
                         call_id: call.id.clone(),
                         exit_code: None,
@@ -350,6 +378,12 @@ impl Agent {
                 }
                 Err(e) => {
                     let msg = format!("tool error: {e}");
+                    self.log_tool_finished(
+                        &call.id,
+                        crate::session::ToolEventState::Failed,
+                        &msg,
+                    )
+                    .await;
                     send(AgentEvent::ToolCallCompleted {
                         call_id: call.id.clone(),
                         exit_code: None,
@@ -398,6 +432,20 @@ impl Agent {
         }
 
         Ok(None)
+    }
+
+    /// Best-effort write of a terminal tool-execution record. Failures are
+    /// logged: the recovery log is auxiliary to the transcript itself.
+    async fn log_tool_finished(&self, call_id: &str, state: crate::session::ToolEventState, output: &str) {
+        if let Some(sid) = self.session_id {
+            if let Err(e) = self
+                .store
+                .record_tool_finished(sid, call_id, state, output)
+                .await
+            {
+                tracing::warn!("tool event log (finished) failed: {e}");
+            }
+        }
     }
 
     /// Record `reason` results for calls that will never run this turn

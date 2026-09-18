@@ -8,6 +8,7 @@ pub mod error;
 pub mod event;
 pub mod history;
 pub mod message;
+pub mod recovery;
 pub mod registry;
 pub mod session;
 pub mod traits;

@@ -7,7 +7,7 @@ use forge_core::cancel::CancelHandle;
 use forge_core::event::AgentEvent;
 use forge_core::message::{Message, ToolCall, Usage};
 use forge_core::registry::Registry;
-use forge_core::session::{AllowAll, SessionStore};
+use forge_core::session::{AllowAll, SessionStore, ToolEvent, ToolEventState};
 use forge_core::traits::{
     ModelProvider, ModelRequest, ProviderEvent, Tool, ToolCallbacks, ToolOutput,
 };
@@ -131,6 +131,7 @@ impl Tool for EchoTool {
 struct MemStore {
     sessions: Mutex<Vec<uuid::Uuid>>,
     msgs: Mutex<Vec<(uuid::Uuid, Vec<Message>)>>,
+    tool_events: Mutex<Vec<(uuid::Uuid, ToolEvent)>>,
     replaces: AtomicUsize,
     appends: AtomicUsize,
     load_fails: std::sync::atomic::AtomicBool,
@@ -193,6 +194,55 @@ impl SessionStore for MemStore {
     }
     async fn rename_session(&self, _id: uuid::Uuid, _t: &str) -> forge_core::Result<()> {
         Ok(())
+    }
+    async fn record_tool_started(
+        &self,
+        session_id: uuid::Uuid,
+        call_id: &str,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> forge_core::Result<()> {
+        self.tool_events.lock().unwrap().push((
+            session_id,
+            ToolEvent {
+                call_id: call_id.to_string(),
+                tool: tool.to_string(),
+                arguments: arguments.clone(),
+                state: ToolEventState::Started,
+                output: String::new(),
+            },
+        ));
+        Ok(())
+    }
+    async fn record_tool_finished(
+        &self,
+        session_id: uuid::Uuid,
+        call_id: &str,
+        state: ToolEventState,
+        output: &str,
+    ) -> forge_core::Result<()> {
+        let mut all = self.tool_events.lock().unwrap();
+        if let Some(slot) = all
+            .iter_mut()
+            .find(|(id, e)| *id == session_id && e.call_id == call_id)
+        {
+            slot.1.state = state;
+            slot.1.output = output.to_string();
+        }
+        Ok(())
+    }
+    async fn load_tool_events(
+        &self,
+        session_id: uuid::Uuid,
+    ) -> forge_core::Result<Vec<ToolEvent>> {
+        Ok(self
+            .tool_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| *id == session_id)
+            .map(|(_, e)| e.clone())
+            .collect())
     }
     async fn set_meta(
         &self,
@@ -309,6 +359,15 @@ async fn agent_loop_full_cycle() {
     } else {
         panic!("expected tool result");
     }
+
+    // Execution log: the call was recorded started, then completed with
+    // the same output the transcript holds (S1 recovery input).
+    let tool_events = store.load_tool_events(sid).await.unwrap();
+    assert_eq!(tool_events.len(), 1, "one executed call, one log record");
+    assert_eq!(tool_events[0].call_id, "call_1");
+    assert_eq!(tool_events[0].tool, "echo");
+    assert_eq!(tool_events[0].state, ToolEventState::Completed);
+    assert_eq!(tool_events[0].output, "echo: hi");
 
     // Events: streamed deltas and tool lifecycle fired in order; usage is
     // CUMULATIVE for the turn (60 + 95), matching the event contract.
