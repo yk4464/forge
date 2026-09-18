@@ -1,12 +1,15 @@
 # forge 配置示例 — 复制为 config.toml 并填入你的厂商信息
-# 放在项目根目录（D:\agent\config.toml）或 ~/.forge/config.toml
+# 放在项目根目录或 ~/.forge/config.toml
 
 [provider]
-# 协议面：M1 支持 "openai"（/v1/chat/completions，兼容 DeepSeek/智谱/通义等）
+# 协议面，三选一：
+#   "openai"    — POST /v1/chat/completions（OpenAI 兼容，覆盖 DeepSeek/智谱/通义等）
+#   "responses" — POST /v1/responses（OpenAI Responses API）
+#   "anthropic" — POST /v1/messages（Anthropic Messages API）
 protocol = "openai"
 # base_url（带不带 /v1 都可以）
 base_url = "https://api.deepseek.com"
-# 从哪个环境变量读 API key
+# 从哪个环境变量读 API key；也可直接用 api_key = "sk-..." 内联（优先级更高）
 api_key_env = "DEEPSEEK_API_KEY"
 
 [model]

@@ -9,9 +9,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 license = "MIT"
+authors = ["yk4464"]
+description = "forge — a streaming-first coding agent in Rust (TUI, MCP-ready core)"
+repository = "https://github.com/yk4464/forge"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

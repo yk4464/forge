@@ -2,6 +2,7 @@
 config.toml
 forge.toml
 .forge-logs/
+.zcode/
 *.db
 *.db-shm
 *.db-wal

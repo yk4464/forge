@@ -509,7 +509,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "forge-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "forge-provider"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "forge-storage"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "forge-tools"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "forge-core",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "forge-tui"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono",
