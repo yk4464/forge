@@ -63,12 +63,12 @@ forge check "查看当前目录结构并总结"
 
 ## Roadmap
 
+详见 [ROADMAP.md](ROADMAP.md)（功能全景，不排期）。概览：
+
 - [x] M1：核心循环 + TUI + 三协议面 + SQLite + 上下文压缩
-- [ ] M2：Web UI（Axum + React）
-- [ ] M2：Tauri 2 桌面端（复用 Web UI）
-- [ ] MCP（rmcp）接入
-- [ ] Skills / Hooks 具体实现（trait 占位已在）
-- [ ] 权限策略细化（逐工具审批）
+- [ ] 文件编辑/搜索工具、权限与沙箱、MCP、Skills、Hooks
+- [ ] 子代理与多终端协作、图片输入、模型回退/OAuth/用量统计
+- [ ] Web UI（Axum + React）、Tauri 2 桌面端
 
 ## License
 

@@ -63,12 +63,12 @@ See [config.example.toml](config.example.toml) — every field is commented: pro
 
 ## Roadmap
 
+See [ROADMAP.md](ROADMAP.md) for the full feature map (unscheduled). Overview:
+
 - [x] M1: agent loop + TUI + three protocols + SQLite + context compaction
-- [ ] M2: Web UI (Axum + React)
-- [ ] M2: Tauri 2 desktop app (reusing the Web UI)
-- [ ] MCP integration (rmcp)
-- [ ] Concrete Skills / Hooks implementations (trait stubs already in place)
-- [ ] Fine-grained permission policies (per-tool approval)
+- [ ] File edit/search tools, permissions & sandbox, MCP, Skills, Hooks
+- [ ] Sub-agents & cross-terminal collaboration, image input, model fallback/OAuth/usage stats
+- [ ] Web UI (Axum + React), Tauri 2 desktop app
 
 ## License
 
