@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_loop;
+pub mod cancel;
 pub mod compact;
 pub mod config;
 pub mod context;

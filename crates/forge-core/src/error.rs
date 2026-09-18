@@ -22,6 +22,9 @@ pub enum Error {
     #[error("channel closed: {0}")]
     ChannelClosed(String),
 
+    #[error("turn cancelled")]
+    Cancelled,
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

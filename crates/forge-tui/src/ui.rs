@@ -241,7 +241,7 @@ fn draw_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         Color::Green
     };
-    let line = RLine::from(vec![
+    let mut hints = vec![
         Span::styled(
             format!(" {} ", app.status),
             Style::default().fg(Color::Black).bg(status_color),
@@ -251,7 +251,11 @@ fn draw_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Span::styled("/compact ", Style::default().fg(ACCENT)),
         Span::styled("/exit", Style::default().fg(ACCENT)),
         Span::styled("  ↑↓ scroll", Style::default().fg(DIM)),
-    ]);
+    ];
+    if app.busy {
+        hints.push(Span::styled("  Esc cancel", Style::default().fg(Color::Yellow)));
+    }
+    let line = RLine::from(hints);
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -319,6 +323,11 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> bool {
             app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(3);
             false
         }
+        KeyCode::Esc => {
+            // Stop the current task (distinct from quitting the app).
+            app.cancel_requested = true;
+            false
+        }
         KeyCode::Down => {
             app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(3);
             false
@@ -330,6 +339,18 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn esc_requests_cancellation_without_quitting() {
+        // Esc stops the current task; quitting stays on Ctrl+C / /exit.
+        let mut app = App::new();
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!on_key(&mut app, key));
+        assert!(app.cancel_requested);
+        assert!(!app.should_quit);
+        assert!(app.take_cancel_request());
+        assert!(!app.cancel_requested);
+    }
 
     #[test]
     fn wrap_ascii_respects_width() {

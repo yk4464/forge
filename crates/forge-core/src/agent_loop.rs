@@ -43,8 +43,9 @@ impl Agent {
         &self,
         user_input: &str,
         events: mpsc::UnboundedSender<AgentEvent>,
+        cancel: &crate::cancel::CancelToken,
     ) -> Result<String> {
-        match self.run_turn_inner(user_input, &events).await {
+        match self.run_turn_inner(user_input, &events, cancel).await {
             Ok((text, usage)) => {
                 let _ = events.send(AgentEvent::TurnCompleted { usage });
                 Ok(text)
@@ -61,6 +62,7 @@ impl Agent {
         &self,
         user_input: &str,
         events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &crate::cancel::CancelToken,
     ) -> Result<(String, Usage)> {
         let send = |ev: AgentEvent| -> bool {
             events.send(ev).is_ok()
@@ -73,7 +75,7 @@ impl Agent {
         }
 
         // Pre-turn compaction.
-        self.maybe_compact(events).await?;
+        self.maybe_compact(events, cancel).await?;
 
         self.context.lock().await.push(Message::user(user_input));
         self.persist_new_items().await;
@@ -86,7 +88,10 @@ impl Agent {
         // context-window rejection we compact once and retry (bounded).
         let mut overflow_retried = false;
         loop {
-            let attempt = self.one_model_attempt(events, &mut turn_usage).await;
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let attempt = self.one_model_attempt(events, &mut turn_usage, cancel).await;
             match attempt {
                 Ok(Some(text)) => {
                     self.persist_new_items().await;
@@ -130,6 +135,7 @@ impl Agent {
         &self,
         events: &mpsc::UnboundedSender<AgentEvent>,
         turn_usage: &mut Usage,
+        cancel: &crate::cancel::CancelToken,
     ) -> Result<Option<String>> {
         let send = |ev: AgentEvent| -> bool {
             events.send(ev).is_ok()
@@ -165,7 +171,16 @@ impl Agent {
         let mut text = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
 
-        while let Some(ev) = stream.next().await {
+        // Consume the stream, racing cancellation: dropping the stream
+        // aborts the in-flight HTTP request.
+        loop {
+            let ev = tokio::select! {
+                ev = stream.next() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                },
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+            };
             match ev {
                 crate::traits::ProviderEvent::MessageDelta { delta } => {
                     text.push_str(&delta);
@@ -221,7 +236,34 @@ impl Agent {
         }
 
         // ---- execute each tool call ----
-        for call in &calls {
+        for (call_idx, call) in calls.iter().enumerate() {
+            // Cancellation: every started call must get a recorded result
+            // (providers reject dangling tool_use), so mark this and all
+            // remaining calls as cancelled, then stop the turn.
+            if cancel.is_cancelled() {
+                for c in &calls[call_idx..] {
+                    send(AgentEvent::ToolCallStarted {
+                        call_id: c.id.clone(),
+                        name: c.name.clone(),
+                        command: c.arguments.to_string(),
+                    });
+                    self.context.lock().await.push(Message::ToolResult {
+                        tool_call_id: c.id.clone(),
+                        content: "cancelled by user".into(),
+                        is_error: true,
+                    });
+                    send(AgentEvent::ToolCallCompleted {
+                        call_id: c.id.clone(),
+                        exit_code: None,
+                        timed_out: false,
+                        duration_ms: 0,
+                        output: "cancelled by user".into(),
+                    });
+                }
+                self.persist_new_items().await;
+                return Err(Error::Cancelled);
+            }
+
             let args_json = call.arguments.to_string();
             if !self.permissions.approve(&call.name, &call.arguments).await {
                 let refusal = format!("Permission denied for tool {0}", call.name);
@@ -259,10 +301,17 @@ impl Agent {
                 call_id: call.id.clone(),
                 events: events.clone(),
             };
+            // Race execution against cancellation: dropping the tool
+            // future kills the child process (kill_on_drop + Job Object).
             let result = match self.tools.get(&call.name) {
-                Some(tool) => tool
-                    .execute(&call.id, call.arguments.clone(), &emitter)
-                    .await,
+                Some(tool) => {
+                    let fut = tool.execute(&call.id, call.arguments.clone(), &emitter);
+                    tokio::pin!(fut);
+                    tokio::select! {
+                        r = &mut fut => r,
+                        _ = cancel.cancelled() => Err(Error::Cancelled),
+                    }
+                }
                 None => Err(Error::Tool(format!("unknown tool: {}", call.name))),
             };
 
@@ -276,6 +325,16 @@ impl Agent {
                         output: out.content.clone(),
                     });
                     (out.content, false)
+                }
+                Err(Error::Cancelled) => {
+                    send(AgentEvent::ToolCallCompleted {
+                        call_id: call.id.clone(),
+                        exit_code: None,
+                        timed_out: false,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        output: "cancelled by user".into(),
+                    });
+                    ("cancelled by user".to_string(), true)
                 }
                 Err(e) => {
                     let msg = format!("tool error: {e}");
@@ -307,7 +366,7 @@ impl Agent {
 
             // Mid-turn compaction check after every tool output
             // (avoids the codex #16033 between-turns-only bug).
-            self.maybe_compact(events).await?;
+            self.maybe_compact(events, cancel).await?;
         }
 
         Ok(None)
@@ -346,7 +405,13 @@ impl Agent {
     async fn maybe_compact(
         &self,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> Result<()> {        let needed = {
+        cancel: &crate::cancel::CancelToken,
+    ) -> Result<()> {
+        // A cancelled turn must not spend a model round-trip on a summary.
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let needed = {
             let cm = self.context.lock().await;
             cm.should_compact()
         };

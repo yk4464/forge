@@ -3,6 +3,7 @@
 //! verifying history bookkeeping, persistence, and event flow.
 
 use forge_core::agent_loop::Agent;
+use forge_core::cancel::CancelHandle;
 use forge_core::event::AgentEvent;
 use forge_core::message::{Message, ToolCall, Usage};
 use forge_core::registry::Registry;
@@ -243,7 +244,7 @@ async fn agent_loop_full_cycle() {
     let agent = test_agent(provider, store.clone(), Arc::new(AllowAll), Some(sid));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let final_text = agent.run_turn("do the thing", tx).await.unwrap();
+    let final_text = agent.run_turn("do the thing", tx, &CancelHandle::default().token()).await.unwrap();
 
     assert_eq!(final_text, "All done!");
 
@@ -321,7 +322,7 @@ async fn permission_denial_emits_paired_events() {
     let agent = test_agent(provider, store.clone(), Arc::new(DenyAll), Some(sid));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    agent.run_turn("try the tool", tx).await.unwrap();
+    agent.run_turn("try the tool", tx, &CancelHandle::default().token()).await.unwrap();
 
     // Every Started must be paired with a Completed; the old denial path
     // emitted only Completed, which UI consumers silently dropped.
@@ -374,7 +375,7 @@ async fn empty_response_is_not_persisted() {
     let agent = test_agent(provider, store.clone(), Arc::new(AllowAll), Some(sid));
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let final_text = agent.run_turn("go", tx).await.unwrap();
+    let final_text = agent.run_turn("go", tx, &CancelHandle::default().token()).await.unwrap();
     assert_eq!(final_text, "");
 
     let persisted = store.load_messages(sid).await.unwrap();
@@ -419,7 +420,7 @@ async fn provider_failure_still_emits_terminal_events() {
     let agent = test_agent(provider, store.clone(), Arc::new(AllowAll), None);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let result = agent.run_turn("hi", tx).await;
+    let result = agent.run_turn("hi", tx, &CancelHandle::default().token()).await;
     assert!(result.is_err());
 
     let mut events = Vec::new();
@@ -476,7 +477,7 @@ async fn context_overflow_compacts_and_retries_once() {
         .push(Message::system("stay terse; never force-push"));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let final_text = agent.run_turn("long task", tx).await.unwrap();
+    let final_text = agent.run_turn("long task", tx, &CancelHandle::default().token()).await.unwrap();
     assert_eq!(final_text, "recovered");
     assert_eq!(mock.calls.load(Ordering::SeqCst), 3, "overflow + summarize + retry");
 
@@ -497,4 +498,123 @@ async fn context_overflow_compacts_and_retries_once() {
         }
     }
     assert!(saw_compaction, "compaction must run during the retry");
+}
+
+/// A tool that cancels its own turn and then blocks: the agent loop must
+/// win the race against it, record a cancelled result, and end the turn.
+struct CancelTool(forge_core::cancel::CancelHandle);
+
+#[async_trait]
+impl Tool for CancelTool {
+    fn name(&self) -> &str {
+        "cancel-self"
+    }
+    fn description(&self) -> &str {
+        "cancels the turn"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _call_id: &str,
+        _args: serde_json::Value,
+        _emit: &dyn ToolCallbacks,
+    ) -> forge_core::Result<ToolOutput> {
+        self.0.cancel();
+        // Keep the future alive so the loop's cancel race is what wins.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        Ok(ToolOutput {
+            content: "never reached".into(),
+            exit_code: Some(0),
+            timed_out: false,
+            duration_ms: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancel_mid_tool_ends_turn_and_keeps_history_valid() {
+    // Turn 0 asks for the self-cancelling tool. The turn must end with
+    // terminal events and a protocol-valid history (the started call gets
+    // a recorded result — providers reject dangling tool_use), and turn 1
+    // must still work.
+    let mock = Arc::new(MockProvider::new(vec![
+        Box::new(|| {
+            Ok(vec![
+                ProviderEvent::ToolCalls {
+                    calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "cancel-self".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                },
+                ProviderEvent::Done,
+            ])
+        }),
+        Box::new(|| {
+            Ok(vec![
+                ProviderEvent::MessageDelta { delta: "resumed".into() },
+                ProviderEvent::Done,
+            ])
+        }),
+    ]));
+    let provider: Arc<dyn ModelProvider> = mock.clone();
+    let store: Arc<dyn SessionStore> = Arc::new(MemStore::default());
+    let agent = test_agent(provider, store, Arc::new(AllowAll), None);
+    let handle = CancelHandle::default();
+    let mut agent = agent;
+    agent.tools.register(Arc::new(CancelTool(handle.clone())));
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = agent.run_turn("run it", tx, &handle.token()).await;
+    assert!(
+        matches!(result, Err(forge_core::Error::Cancelled)),
+        "got {result:?}"
+    );
+
+    // Terminal events still fire on the cancelled path.
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("cancel"))),
+        "an Error event must surface the cancellation"
+    );
+    assert!(matches!(events.last(), Some(AgentEvent::TurnCompleted { .. })));
+
+    // History is protocol-valid: assistant call c1 paired with a result.
+    let msgs = agent.context.lock().await.history.snapshot();
+    assert!(
+        matches!(&msgs[msgs.len() - 2], Message::Assistant { tool_calls, .. }
+            if tool_calls.iter().any(|c| c.id == "c1")),
+        "expected the assistant caller, got {:?}",
+        msgs[msgs.len() - 2]
+    );
+    match &msgs[msgs.len() - 1] {
+        Message::ToolResult { tool_call_id, content, is_error } => {
+            assert_eq!(tool_call_id, "c1");
+            assert!(content.contains("cancel"));
+            assert!(is_error);
+        }
+        other => panic!("expected cancelled tool result, got {other:?}"),
+    }
+
+    // The very next turn works, and its request carries the paired result.
+    let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+    let text = agent
+        .run_turn("continue", tx2, &CancelHandle::default().token())
+        .await
+        .unwrap();
+    assert_eq!(text, "resumed");
+    let reqs = mock.requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    assert!(
+        matches!(&reqs[1][2], Message::ToolResult { content, .. } if content.contains("cancel")),
+        "second request must include the cancelled result: {:?}",
+        reqs[1]
+    );
 }

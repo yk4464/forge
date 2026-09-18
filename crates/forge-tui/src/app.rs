@@ -47,6 +47,9 @@ pub struct App {
     pub open_tools: std::collections::HashMap<String, (String, String)>,
     pub status: String,
     pub should_quit: bool,
+    /// Esc was pressed; the main loop consumes this and signals the
+    /// in-flight turn's cancel handle.
+    pub cancel_requested: bool,
 }
 
 impl App {
@@ -63,7 +66,14 @@ impl App {
             open_tools: std::collections::HashMap::new(),
             status: String::from("ready"),
             should_quit: false,
+            cancel_requested: false,
         }
+    }
+
+    /// Esc pressed while a turn runs: consumed once by the main loop,
+    /// which forwards it to the turn's cancel handle.
+    pub fn take_cancel_request(&mut self) -> bool {
+        std::mem::replace(&mut self.cancel_requested, false)
     }
 
     /// Drop transcript + in-flight rendering state (used by /new).

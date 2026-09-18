@@ -138,8 +138,10 @@ async fn run_check(prompt: String) -> anyhow::Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent2 = agent.clone();
+    let cancel = forge_core::cancel::CancelHandle::default();
+    let token = cancel.token();
     let handle = tokio::spawn(async move {
-        agent2.run_turn(&prompt, tx).await
+        agent2.run_turn(&prompt, tx, &token).await
     });
     let mut saw_error = false;
     while let Some(ev) = rx.recv().await {
@@ -236,6 +238,9 @@ async fn run_tui() -> anyhow::Result<()> {
     // The live agent is kept across turns so context/history persist
     // within a session; rebuilt on /new and /resume.
     let mut agent: Option<Arc<Agent>> = None;
+    // Cancel handle for the turn in flight; Esc signals it, and it is
+    // dropped once the turn reaches its terminal state.
+    let mut turn_cancel: Option<forge_core::cancel::CancelHandle> = None;
 
     loop {
         // Redraw.
@@ -247,11 +252,22 @@ async fn run_tui() -> anyhow::Result<()> {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     let submit = ui::on_key(&mut app, key);
+                    if app.take_cancel_request() && app.busy {
+                        if let Some(h) = &turn_cancel {
+                            h.cancel();
+                            app.status = "cancelling…".into();
+                        }
+                    }
                     if submit {
                         let action = app.on_submit();
                         // /exit must work even mid-turn: the agent task
                         // outlives the UI loop and the process exits.
                         if matches!(action, CommandAction::Exit) {
+                            // Stop the in-flight turn before leaving so the
+                            // child process tree is not left running.
+                            if let Some(h) = &turn_cancel {
+                                h.cancel();
+                            }
                             app.should_quit = true;
                         } else if !app.busy {
                             match action {
@@ -274,9 +290,12 @@ async fn run_tui() -> anyhow::Result<()> {
                                         let text = text.clone();
                                         let tx_guard = tx.clone();
                                         app.busy = true;
+                                        let ch = forge_core::cancel::CancelHandle::default();
+                                        let token = ch.token();
+                                        turn_cancel = Some(ch);
                                         tokio::spawn(async move {
                                             let inner = tokio::spawn(async move {
-                                                a.run_turn(&text, tx).await
+                                                a.run_turn(&text, tx, &token).await
                                             });
                                             // run_turn guarantees terminal
                                             // events; this only catches a
@@ -370,6 +389,10 @@ async fn run_tui() -> anyhow::Result<()> {
         // Drain agent events.
         while let Ok(ev) = events_rx.try_recv() {
             app.on_agent_event(ev);
+        }
+        if !app.busy {
+            // Terminal state reached: the handle has served its purpose.
+            turn_cancel = None;
         }
 
         if app.should_quit {
