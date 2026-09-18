@@ -126,6 +126,7 @@ impl Tool for ShellTool {
         arguments: Value,
         emit: &dyn ToolCallbacks,
     ) -> Result<ToolOutput> {
+        let started_at = std::time::Instant::now();
         let args: ShellArgs = serde_json::from_value(arguments)
             .map_err(|e| Error::Tool(format!("bad arguments: {e}")))?;
 
@@ -133,11 +134,12 @@ impl Tool for ShellTool {
             .resolve_bash()
             .ok_or_else(|| Error::Tool("bash.exe not found; set context.shell_path in config.toml".into()))?;
 
-        let timeout = Duration::from_secs(
+        // timeout_ms is milliseconds: no integer-second truncation here.
+        // Values below 100ms clamp up so 0 cannot mean "kill instantly".
+        let timeout = Duration::from_millis(
             args.timeout_ms
                 .unwrap_or(self.default_timeout.as_millis() as u64)
-                .min(MAX_TIMEOUT_SECS * 1000)
-                / 1000,
+                .min(MAX_TIMEOUT_SECS * 1000),
         )
         .max(Duration::from_millis(100));
 
@@ -149,8 +151,21 @@ impl Tool for ShellTool {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .env("FORGE_AGENT", "1");
+            .kill_on_drop(true);
+        // Strip credential-shaped variables so a model-executed command
+        // cannot `printenv` the API key into tool output (which lands in
+        // the model context and logs). FORGE_AGENT is re-added below.
+        for (name, _) in std::env::vars() {
+            let upper = name.to_uppercase();
+            if upper.contains("API_KEY")
+                || upper.contains("APIKEY")
+                || upper.ends_with("_TOKEN")
+                || upper.starts_with("FORGE_")
+            {
+                cmd.env_remove(&name);
+            }
+        }
+        cmd.env("FORGE_AGENT", "1");
 
         let mut child = cmd
             .spawn()
@@ -239,7 +254,7 @@ impl Tool for ShellTool {
             content: merged,
             exit_code,
             timed_out,
-            duration_ms: 0, // caller measures; kept for API completeness
+            duration_ms: started_at.elapsed().as_millis() as u64,
         })
     }
 }
@@ -332,6 +347,57 @@ mod tests {
             .await
             .unwrap();
         assert!(out.timed_out);
+    }
+
+    #[tokio::test]
+    async fn subsecond_timeout_is_preserved() {
+        // timeout_ms=300 used to be truncated to 0s (then clamped to 100ms);
+        // it must now hold for the full 300ms.
+        let t = tool();
+        let emit = Arc::new(NullEmit);
+        let start = std::time::Instant::now();
+        let out = t
+            .execute("c1", json!({"command": "sleep 10", "timeout_ms": 300}), &*emit)
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(280) && elapsed < Duration::from_millis(2000),
+            "elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duration_ms_is_measured() {
+        let t = tool();
+        let emit = Arc::new(NullEmit);
+        let out = t
+            .execute("c1", json!({"command": "sleep 0.2"}), &*emit)
+            .await
+            .unwrap();
+        assert!(
+            out.duration_ms >= 150,
+            "expected real duration, got {} ms",
+            out.duration_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn secrets_are_stripped_from_child_env() {
+        std::env::set_var("FORGE_API_KEY", "supersecret");
+        let t = tool();
+        let emit = Arc::new(NullEmit);
+        let out = t
+            .execute("c1", json!({"command": "printenv FORGE_API_KEY || echo stripped"}), &*emit)
+            .await
+            .unwrap();
+        assert!(
+            !out.content.contains("supersecret"),
+            "API key leaked into tool output: {}",
+            out.content
+        );
+        assert!(out.content.contains("stripped"), "got: {}", out.content);
     }
 
     #[tokio::test]
