@@ -2,8 +2,10 @@
 
 ## 项目定位
 
-forge：Rust 编写的流式优先终端编程 Agent（v0.0.1 原型）。单一 shell 工具，
+forge：Rust 编写的流式优先终端编程 Agent（v0.1.0）。单一 shell 工具，
 三个 LLM 协议面，Codex 风格上下文压缩，SQLite 会话持久化，Ratatui TUI。
+版本策略：每完成一个 ROADMAP 阶段 minor +1（当前 v0.1.0 = S0 完成 + S1 取消开工），
+阶段间修复 patch +1；变更记录在 `CHANGELOG.md`。
 
 ## 结构（Cargo workspace，5 crates）
 

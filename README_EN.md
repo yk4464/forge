@@ -1,6 +1,6 @@
 # forge
 
-⚡ A streaming-first terminal coding agent written in Rust (v0.0.1 prototype).
+⚡ A streaming-first terminal coding agent written in Rust (v0.1.0).
 
 English | [中文](README.md)
 
@@ -64,7 +64,7 @@ See [config.example.toml](config.example.toml) — every field is commented: pro
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for the full feature map, dependencies, implementation order, and acceptance criteria. These stages do not promise calendar dates. v0.0.1 provides the agent loop, TUI, three protocols, SQLite, and basic context compaction; the S0 baseline fixes were completed on 2026-09-19 and work now moves on to S1.
+See [ROADMAP.md](ROADMAP.md) for the full feature map, dependencies, implementation order, and acceptance criteria. These stages do not promise calendar dates. v0.1.0 provides the agent loop, TUI, three protocols, SQLite, context compaction, and turn cancellation; the S0 baseline fixes were completed on 2026-09-19 and S1 is underway.
 
 - [x] **S0 Baseline fixes**: shell streaming and memory bounds, error completion, compaction message integrity (completed 2026-09-19)
 - [ ] **S1 Runtime and data reliability**: cancellation, original records, crash recovery, task budgets, runtime interfaces
