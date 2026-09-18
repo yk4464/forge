@@ -26,6 +26,8 @@ pub struct Agent {
     pub model: String,
     pub temperature: Option<f64>,
     pub max_tokens: u32,
+    /// Per-turn budget limits and loop-detection threshold.
+    pub budget: crate::config::BudgetConfig,
     /// Session id for persistence; None = ephemeral.
     pub session_id: Option<uuid::Uuid>,
     /// How many history items are already stored. Growth appends; a
@@ -94,6 +96,7 @@ impl Agent {
         send(AgentEvent::TurnStarted);
 
         let mut turn_usage = Usage::default();
+        let mut turn = TurnBudget::new(self.budget.clone());
 
         // One attempt = build request, stream response, run tools. On a
         // context-window rejection we compact once and retry (bounded).
@@ -102,7 +105,12 @@ impl Agent {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let attempt = self.one_model_attempt(events, &mut turn_usage, cancel).await;
+            if let Some(reason) = turn.between_attempts_reason(turn_usage.total_tokens) {
+                return Err(Error::BudgetExceeded(reason));
+            }
+            let attempt = self
+                .one_model_attempt(events, &mut turn_usage, cancel, &mut turn)
+                .await;
             match attempt {
                 Ok(Some(text)) => {
                     self.persist_state(Some(events)).await;
@@ -145,6 +153,7 @@ impl Agent {
         events: &mpsc::UnboundedSender<AgentEvent>,
         turn_usage: &mut Usage,
         cancel: &crate::cancel::CancelToken,
+        turn: &mut TurnBudget,
     ) -> Result<Option<String>> {
         let send = |ev: AgentEvent| -> bool {
             events.send(ev).is_ok()
@@ -248,32 +257,25 @@ impl Agent {
         for (call_idx, call) in calls.iter().enumerate() {
             // Cancellation: every started call must get a recorded result
             // (providers reject dangling tool_use), so mark this and all
-            // remaining calls as cancelled, then stop the turn.
+            // remaining calls, then stop the turn.
             if cancel.is_cancelled() {
-                for c in &calls[call_idx..] {
-                    send(AgentEvent::ToolCallStarted {
-                        call_id: c.id.clone(),
-                        name: c.name.clone(),
-                        command: c.arguments.to_string(),
-                    });
-                    self.context.lock().await.push(Message::ToolResult {
-                        tool_call_id: c.id.clone(),
-                        content: "cancelled by user".into(),
-                        is_error: true,
-                    });
-                    send(AgentEvent::ToolCallCompleted {
-                        call_id: c.id.clone(),
-                        exit_code: None,
-                        timed_out: false,
-                        duration_ms: 0,
-                        output: "cancelled by user".into(),
-                    });
-                }
-                self.persist_state(Some(events)).await;
+                self.record_skipped_results(&calls[call_idx..], "cancelled by user", events)
+                    .await;
                 return Err(Error::Cancelled);
             }
 
             let args_json = call.arguments.to_string();
+            // Budgets and runaway detection: skip this and the remaining
+            // calls with recorded results, then stop with an explanation.
+            if let Some(reason) = turn.before_call_reason(&call.name, &args_json) {
+                self.record_skipped_results(
+                    &calls[call_idx..],
+                    &format!("not executed: {reason}"),
+                    events,
+                )
+                .await;
+                return Err(Error::BudgetExceeded(reason));
+            }
             if !self.permissions.approve(&call.name, &call.arguments).await {
                 let refusal = format!("Permission denied for tool {0}", call.name);
                 // Started/Completed must stay paired: UI consumers key
@@ -304,6 +306,7 @@ impl Agent {
                 name: call.name.clone(),
                 command: args_json.clone(),
             });
+            turn.tool_calls += 1;
 
             let started = std::time::Instant::now();
             let emitter = EventEmitter {
@@ -368,10 +371,26 @@ impl Agent {
 
             self.context.lock().await.push(Message::ToolResult {
                 tool_call_id: call.id.clone(),
-                content,
+                content: content.clone(),
                 is_error,
             });
             self.persist_state(Some(events)).await;
+
+            // Same-error runaway detection: the failed call's result is
+            // recorded above; remaining batch calls get skip records.
+            if is_error {
+                if let Some(reason) = turn.note_error(&call.name, &content) {
+                    self.record_skipped_results(
+                        &calls[call_idx + 1..],
+                        &format!("not executed: {reason}"),
+                        events,
+                    )
+                    .await;
+                    return Err(Error::BudgetExceeded(reason));
+                }
+            } else {
+                turn.note_success();
+            }
 
             // Mid-turn compaction check after every tool output
             // (avoids the codex #16033 between-turns-only bug).
@@ -379,6 +398,36 @@ impl Agent {
         }
 
         Ok(None)
+    }
+
+    /// Record `reason` results for calls that will never run this turn
+    /// (budget stop or cancellation), keeping history protocol-valid.
+    async fn record_skipped_results(
+        &self,
+        calls: &[ToolCall],
+        reason: &str,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        for c in calls {
+            let _ = events.send(AgentEvent::ToolCallStarted {
+                call_id: c.id.clone(),
+                name: c.name.clone(),
+                command: c.arguments.to_string(),
+            });
+            self.context.lock().await.push(Message::ToolResult {
+                tool_call_id: c.id.clone(),
+                content: reason.to_string(),
+                is_error: true,
+            });
+            let _ = events.send(AgentEvent::ToolCallCompleted {
+                call_id: c.id.clone(),
+                exit_code: None,
+                timed_out: false,
+                duration_ms: 0,
+                output: reason.to_string(),
+            });
+        }
+        self.persist_state(Some(events)).await;
     }
 
     /// Manual compaction entry (/compact): compact now regardless of the
@@ -492,6 +541,103 @@ impl Agent {
                 }
             }
         }
+    }
+}
+
+/// Per-turn budget state: wall clock, executed tool calls, and the
+/// consecutive-identical streaks used for runaway detection.
+struct TurnBudget {
+    cfg: crate::config::BudgetConfig,
+    started_at: std::time::Instant,
+    tool_calls: u32,
+    last_call: Option<(String, String)>,
+    call_streak: u32,
+    last_error: Option<(String, String)>,
+    error_streak: u32,
+}
+
+impl TurnBudget {
+    fn new(cfg: crate::config::BudgetConfig) -> Self {
+        Self {
+            cfg,
+            started_at: std::time::Instant::now(),
+            tool_calls: 0,
+            last_call: None,
+            call_streak: 0,
+            last_error: None,
+            error_streak: 0,
+        }
+    }
+
+    /// Why the turn must stop before issuing the next model request.
+    fn between_attempts_reason(&self, tokens: i64) -> Option<String> {
+        if self.cfg.max_turn_seconds > 0
+            && self.started_at.elapsed().as_secs() >= self.cfg.max_turn_seconds
+        {
+            return Some(format!(
+                "turn time budget reached ({}s); send a new message to continue",
+                self.cfg.max_turn_seconds
+            ));
+        }
+        if self.cfg.max_turn_tokens > 0 && tokens >= self.cfg.max_turn_tokens {
+            return Some(format!(
+                "turn token budget reached (~{tokens} tokens); send a new message to continue"
+            ));
+        }
+        None
+    }
+
+    /// Why `call` must not execute (checked before each tool call). Also
+    /// updates the identical-call streak.
+    fn before_call_reason(&mut self, name: &str, args_json: &str) -> Option<String> {
+        if self.cfg.max_tool_calls > 0 && self.tool_calls >= self.cfg.max_tool_calls {
+            return Some(format!(
+                "tool call budget reached ({} calls this turn); send a new message to continue",
+                self.cfg.max_tool_calls
+            ));
+        }
+        if self.cfg.loop_threshold > 0 {
+            let same = self
+                .last_call
+                .as_ref()
+                .map(|(n, a)| n == name && a == args_json)
+                .unwrap_or(false);
+            self.call_streak = if same { self.call_streak + 1 } else { 1 };
+            self.last_call = Some((name.to_string(), args_json.to_string()));
+            if self.call_streak > self.cfg.loop_threshold {
+                return Some(format!(
+                    "tool loop detected: {name} ran with identical arguments {} times; turn stopped",
+                    self.call_streak - 1
+                ));
+            }
+        }
+        None
+    }
+
+    /// Why the turn must stop after a tool just failed identically again.
+    fn note_error(&mut self, name: &str, msg: &str) -> Option<String> {
+        if self.cfg.loop_threshold == 0 {
+            return None;
+        }
+        let same = self
+            .last_error
+            .as_ref()
+            .map(|(n, m)| n == name && m == msg)
+            .unwrap_or(false);
+        self.error_streak = if same { self.error_streak + 1 } else { 1 };
+        self.last_error = Some((name.to_string(), msg.to_string()));
+        if self.error_streak > self.cfg.loop_threshold {
+            return Some(format!(
+                "tool loop detected: {name} failed with the same error {} times; turn stopped",
+                self.error_streak - 1
+            ));
+        }
+        None
+    }
+
+    fn note_success(&mut self) {
+        self.error_streak = 0;
+        self.last_error = None;
     }
 }
 

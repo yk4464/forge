@@ -492,6 +492,7 @@ async fn build_agent(
             model: cfg.model.name.clone(),
             temperature: cfg.model.temperature,
             max_tokens: cfg.model.max_tokens,
+            budget: cfg.budget.clone(),
             session_id: effective_sid,
             persisted_len: std::sync::atomic::AtomicUsize::new(ctx_len),
             history_replaced: std::sync::atomic::AtomicBool::new(false),

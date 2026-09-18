@@ -25,6 +25,9 @@ pub enum Error {
     #[error("turn cancelled")]
     Cancelled,
 
+    #[error("turn stopped: {0}")]
+    BudgetExceeded(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

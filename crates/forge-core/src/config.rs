@@ -9,6 +9,52 @@ pub struct Config {
     pub model: ModelConfig,
     #[serde(default)]
     pub context: ContextConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
+}
+
+/// Per-turn budget limits and runaway detection. A value of 0 disables
+/// the respective limit; when a limit trips, the turn stops with a clear
+/// explanation and the user can continue with a new message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    /// Max tool calls executed in one turn.
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls: u32,
+    /// Max wall-clock seconds for one turn.
+    #[serde(default = "default_max_turn_seconds")]
+    pub max_turn_seconds: u64,
+    /// Max cumulative tokens (input + output) for one turn.
+    #[serde(default)]
+    pub max_turn_tokens: i64,
+    /// Stop after this many CONSECUTIVE identical tool calls (same tool,
+    /// same arguments) or identical tool errors have already run. 0
+    /// disables loop detection.
+    #[serde(default = "default_loop_threshold")]
+    pub loop_threshold: u32,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_tool_calls: default_max_tool_calls(),
+            max_turn_seconds: default_max_turn_seconds(),
+            max_turn_tokens: 0,
+            loop_threshold: default_loop_threshold(),
+        }
+    }
+}
+
+fn default_max_tool_calls() -> u32 {
+    60
+}
+
+fn default_max_turn_seconds() -> u64 {
+    900
+}
+
+fn default_loop_threshold() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -161,5 +207,26 @@ context_window = 131072
         assert_eq!(cfg.context.context_window, 131072);
         assert_eq!(cfg.context.shell_timeout_secs, 120);
         assert_eq!(cfg.model.max_tokens, 8192);
+        // Missing [budget] section: defaults apply (limits on, 0 = off).
+        assert_eq!(cfg.budget.max_tool_calls, 60);
+        assert_eq!(cfg.budget.max_turn_seconds, 900);
+        assert_eq!(cfg.budget.max_turn_tokens, 0);
+        assert_eq!(cfg.budget.loop_threshold, 5);
+    }
+
+    #[test]
+    fn parses_budget_overrides() {
+        let raw = r#"
+[budget]
+max_tool_calls = 3
+max_turn_seconds = 0
+max_turn_tokens = 100000
+loop_threshold = 2
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.budget.max_tool_calls, 3);
+        assert_eq!(cfg.budget.max_turn_seconds, 0);
+        assert_eq!(cfg.budget.max_turn_tokens, 100000);
+        assert_eq!(cfg.budget.loop_threshold, 2);
     }
 }

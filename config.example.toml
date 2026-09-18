@@ -28,3 +28,15 @@ tool_output_max_bytes = 1048576
 # shell_path = "C:\\Program Files\\Git\\bin\\bash.exe"
 # shell 工具默认超时秒数（最大 600）
 shell_timeout_secs = 120
+
+[budget]
+# 单轮预算：达到上限时本轮停止并给出说明，发新消息即可继续。0 = 不限制。
+# 单轮最多执行的工具调用次数
+max_tool_calls = 60
+# 单轮最长墙钟时间（秒）
+max_turn_seconds = 900
+# 单轮累计 token 上限（输入+输出）
+# max_turn_tokens = 0
+# 连续 N 次完全相同的工具调用（同工具同参数）或相同工具错误后停止本轮，
+# 防止失控循环；调大可容忍更长的正常轮询
+loop_threshold = 5

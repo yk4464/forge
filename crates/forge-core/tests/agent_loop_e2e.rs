@@ -242,6 +242,7 @@ fn test_agent(
         model: "test-model".into(),
         temperature: None,
         max_tokens: 1024,
+        budget: forge_core::config::BudgetConfig::default(),
         session_id,
         persisted_len: std::sync::atomic::AtomicUsize::new(0),
         history_replaced: std::sync::atomic::AtomicBool::new(false),
@@ -683,4 +684,198 @@ async fn persistence_is_append_mostly_and_failures_are_visible() {
         }
     }
     assert!(saw_warning, "storage failure must surface as a Warning");
+}
+
+#[tokio::test]
+async fn tool_call_budget_stops_turn_gracefully() {
+    // One assistant turn requesting two calls with max_tool_calls = 1:
+    // the first runs, the second gets a "not executed" record and the
+    // turn stops with an explanation; history stays protocol-valid.
+    let mock = Arc::new(MockProvider::new(vec![Box::new(|| {
+        Ok(vec![
+            ProviderEvent::ToolCalls {
+                calls: vec![
+                    ToolCall { id: "c1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "a"}) },
+                    ToolCall { id: "c2".into(), name: "echo".into(), arguments: serde_json::json!({"text": "b"}) },
+                ],
+            },
+            ProviderEvent::Done,
+        ])
+    })]));
+    let provider: Arc<dyn ModelProvider> = mock.clone();
+    let store: Arc<dyn SessionStore> = Arc::new(MemStore::default());
+    let mut agent = test_agent(provider, store, Arc::new(AllowAll), None);
+    agent.budget.max_tool_calls = 1;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = agent
+        .run_turn("go", tx, &CancelHandle::default().token())
+        .await;
+    assert!(
+        matches!(&result, Err(forge_core::Error::BudgetExceeded(m)) if m.contains("tool call budget")),
+        "got {result:?}"
+    );
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(matches!(events.last(), Some(AgentEvent::TurnCompleted { .. })));
+
+    let msgs = agent.context.lock().await.history.snapshot();
+    // [user, assistant(c1,c2), result c1, result c2] — no dangling calls.
+    assert_eq!(msgs.len(), 4);
+    match &msgs[3] {
+        Message::ToolResult { tool_call_id, content, is_error } => {
+            assert_eq!(tool_call_id, "c2");
+            assert!(content.contains("not executed"));
+            assert!(is_error);
+        }
+        other => panic!("expected skip record, got {other:?}"),
+    }
+
+    // The user can simply continue with a new message.
+    let mock2 = Arc::new(MockProvider::new(vec![Box::new(|| {
+        Ok(vec![
+            ProviderEvent::MessageDelta { delta: "ok".into() },
+            ProviderEvent::Done,
+        ])
+    })]));
+    agent.provider = mock2;
+    let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+    let text = agent
+        .run_turn("continue", tx2, &CancelHandle::default().token())
+        .await
+        .unwrap();
+    assert_eq!(text, "ok");
+}
+
+#[tokio::test]
+async fn loop_detection_stops_identical_calls() {
+    // Three consecutive attempts asking for the SAME call (same tool,
+    // same arguments) with loop_threshold = 2: the first two run, the
+    // third is blocked as a runaway loop.
+    let mock = Arc::new(MockProvider::new(vec![
+        Box::new(|| {
+            Ok(vec![
+                ProviderEvent::ToolCalls {
+                    calls: vec![ToolCall { id: "c1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "same"}) }],
+                },
+                ProviderEvent::Done,
+            ])
+        }),
+        Box::new(|| {
+            Ok(vec![
+                ProviderEvent::ToolCalls {
+                    calls: vec![ToolCall { id: "c2".into(), name: "echo".into(), arguments: serde_json::json!({"text": "same"}) }],
+                },
+                ProviderEvent::Done,
+            ])
+        }),
+        Box::new(|| {
+            Ok(vec![
+                ProviderEvent::ToolCalls {
+                    calls: vec![ToolCall { id: "c3".into(), name: "echo".into(), arguments: serde_json::json!({"text": "same"}) }],
+                },
+                ProviderEvent::Done,
+            ])
+        }),
+    ]));
+    let provider: Arc<dyn ModelProvider> = mock;
+    let store: Arc<dyn SessionStore> = Arc::new(MemStore::default());
+    let mut agent = test_agent(provider, store, Arc::new(AllowAll), None);
+    agent.budget.loop_threshold = 2;
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = agent
+        .run_turn("loop", tx, &CancelHandle::default().token())
+        .await;
+    assert!(
+        matches!(&result, Err(forge_core::Error::BudgetExceeded(m)) if m.contains("loop detected")),
+        "got {result:?}"
+    );
+    // Every started call has a recorded result — c1, c2 ran, c3 skipped.
+    let msgs = agent.context.lock().await.history.snapshot();
+    let results: Vec<&Message> = msgs.iter().filter(|m| matches!(m, Message::ToolResult { .. })).collect();
+    assert_eq!(results.len(), 3, "no dangling tool_use: {msgs:?}");
+    assert!(
+        matches!(results[2], Message::ToolResult { content, .. } if content.contains("not executed"))
+    );
+}
+
+#[tokio::test]
+async fn time_budget_stops_before_next_request() {
+    // A tool that runs 1.2s with max_turn_seconds = 1: the call finishes
+    // (its result is recorded), then the turn stops at the next-attempt
+    // check instead of issuing another request.
+    struct SlowTool;
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn name(&self) -> &str { "slow" }
+        fn description(&self) -> &str { "slow" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
+        async fn execute(
+            &self,
+            _call_id: &str,
+            _args: serde_json::Value,
+            _emit: &dyn ToolCallbacks,
+        ) -> forge_core::Result<ToolOutput> {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            Ok(ToolOutput { content: "done".into(), exit_code: Some(0), timed_out: false, duration_ms: 1200 })
+        }
+    }
+
+    let mock = Arc::new(MockProvider::new(vec![Box::new(|| {
+        Ok(vec![
+            ProviderEvent::ToolCalls {
+                calls: vec![ToolCall { id: "c1".into(), name: "slow".into(), arguments: serde_json::json!({}) }],
+            },
+            ProviderEvent::Done,
+        ])
+    })]));
+    let provider: Arc<dyn ModelProvider> = mock;
+    let store: Arc<dyn SessionStore> = Arc::new(MemStore::default());
+    let mut agent = test_agent(provider, store, Arc::new(AllowAll), None);
+    let mut agent = agent;
+    agent.tools.register(Arc::new(SlowTool));
+    agent.budget.max_turn_seconds = 1;
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = agent
+        .run_turn("slowly", tx, &CancelHandle::default().token())
+        .await;
+    assert!(
+        matches!(&result, Err(forge_core::Error::BudgetExceeded(m)) if m.contains("time budget")),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn token_budget_stops_after_streamed_usage() {
+    // The response reports 500 cumulative tokens with max_turn_tokens = 100:
+    // the tool call still executes and gets its result, then the turn stops.
+    let mock = Arc::new(MockProvider::new(vec![Box::new(|| {
+        Ok(vec![
+            ProviderEvent::MessageDelta { delta: "working".into() },
+            ProviderEvent::Usage {
+                usage: Usage { input_tokens: 480, output_tokens: 20, total_tokens: 500 },
+            },
+            ProviderEvent::ToolCalls {
+                calls: vec![ToolCall { id: "c1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "x"}) }],
+            },
+            ProviderEvent::Done,
+        ])
+    })]));
+    let provider: Arc<dyn ModelProvider> = mock;
+    let store: Arc<dyn SessionStore> = Arc::new(MemStore::default());
+    let mut agent = test_agent(provider, store, Arc::new(AllowAll), None);
+    agent.budget.max_turn_tokens = 100;
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = agent
+        .run_turn("tokens", tx, &CancelHandle::default().token())
+        .await;
+    assert!(
+        matches!(&result, Err(forge_core::Error::BudgetExceeded(m)) if m.contains("token budget")),
+        "got {result:?}"
+    );
 }
