@@ -20,7 +20,7 @@ forge：Rust 编写的流式优先终端编程 Agent（v0.0.1 原型）。单一
 
 ```bash
 cargo build --workspace          # 必须零警告
-cargo test --workspace           # 当前 67 个测试
+cargo test --workspace           # 当前 72 个测试
 cargo run -p forge-tui           # 跑 TUI
 target/debug/forge check "..."   # 无头验收（复用 check 会话）
 ```
@@ -50,6 +50,11 @@ target/debug/forge check "..."   # 无头验收（复用 check 会话）
   不能跨 spawn，管道块经通道回送本任务）；超时后排水仅 250ms（结果须贴近
   截止时间落地），正常退出排水上限 1.5s（孙进程握住管道写端时兜底）——改
   `shell.rs` 时保持这两个界限。
+- shell 子进程挂在 kill-on-close Job Object 上：超时/取消/命令正常结束都会
+  终止整个进程树（含后台守护进程）——长驻进程等 S4 后台任务管理。
+- 取消：`run_turn` 接收 `CancelToken`（Esc → TUI 持有的 `CancelHandle`）；
+  取消时在执行与未执行的调用都会补 `cancelled by user` 结果，历史必须保持
+  协议合法（无悬空 tool_use）。
 
 ## 必读文档
 

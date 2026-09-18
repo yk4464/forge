@@ -11,7 +11,7 @@ forge runs in your terminal: you give instructions in natural language, it execu
 - **Streaming event interface** — assistant text, reasoning, and tool events drive the Ratatui TUI through `AgentEvent`; shell output is forwarded to the UI live
 - **Three wire protocols, one trait** — `/v1/chat/completions` (OpenAI-compatible: DeepSeek, Zhipu, Qwen, …), `/v1/responses`, and `/v1/messages` (Anthropic format); all SSE-streamed, with `reasoning_content` / `thinking` surfaced as separate events
 - **Codex-style context compaction** — token accounting (local estimate anchored by API usage), dual checkpoints (pre-turn and after every tool output), automatic history compaction past the threshold; `/compact` triggers it manually
-- **Shell tool** — Git Bash execution, timeout control (120s default / 600s max), live output forwarding, and bounded capture (1 MiB per stream, head+tail with a truncation marker); captured output survives a timeout kill
+- **Shell tool** — Git Bash execution, timeout control (120s default / 600s max), live output forwarding, and bounded capture (1 MiB per stream, head+tail with a truncation marker); captured output survives a timeout kill, and the whole process tree is reaped via a Job Object on timeout, cancel, or completion
 - **SQLite session persistence** — WAL mode; `/resume` restores sessions, memory survives across processes
 - **Extensible kernel** — Provider, Tool, Registry, session-storage, and permission interfaces are in place; permissions currently allow all operations, while complete Skills / Hooks contracts and implementations are planned
 
@@ -55,6 +55,7 @@ forge check "Summarize the directory structure"
 | `/resume` | Resume the most recent session |
 | `/compact` | Manually trigger context compaction |
 | `/exit` | Quit |
+| `Esc` | Cancel the running task (while a turn is active) |
 | `/help` | Help |
 
 ## Configuration

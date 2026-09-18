@@ -11,7 +11,7 @@ forge 在终端里运行：你用自然语言下指令，它通过一个 `shell`
 - **流式事件接口** — 正文、推理内容和工具事件通过统一的 `AgentEvent` 接口驱动 Ratatui TUI；shell 输出实时转发到界面
 - **三个协议面，一套 trait** — `/v1/chat/completions`（OpenAI 兼容，覆盖 DeepSeek/智谱/通义）、`/v1/responses`、`/v1/messages`（Anthropic 格式），全部 SSE 流式，`reasoning_content` / `thinking` 独立事件
 - **Codex 风格上下文压缩** — token 记账（本地估算 + API usage 锚定），pre-turn 与每次工具输出后双检查点，超阈值自动压缩历史；`/compact` 可手动触发
-- **shell 工具** — Git Bash 执行命令、超时控制（默认 120s / 上限 600s）、实时输出转发与有界捕获（每流 1 MiB，head+tail + 省略标记）；超时保留已捕获输出
+- **shell 工具** — Git Bash 执行命令、超时控制（默认 120s / 上限 600s）、实时输出转发与有界捕获（每流 1 MiB，head+tail + 省略标记）；超时保留已捕获输出，整个进程树经 Job Object 在超时/取消/命令结束时回收
 - **SQLite 会话持久化** — WAL 模式；`/resume` 恢复会话，跨进程也有记忆
 - **可扩展内核** — 已有 Provider、Tool、Registry、会话存储与权限接口；权限层当前默认放行，Skills / Hooks 的完整契约与实现列入后续阶段
 
@@ -55,6 +55,7 @@ forge check "查看当前目录结构并总结"
 | `/resume` | 恢复最近的会话 |
 | `/compact` | 手动触发上下文压缩 |
 | `/exit` | 退出 |
+| `Esc` | 取消当前任务（运行中生效） |
 | `/help` | 帮助 |
 
 ## 配置
