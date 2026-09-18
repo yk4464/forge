@@ -467,11 +467,28 @@ async fn context_overflow_compacts_and_retries_once() {
     let store: Arc<dyn SessionStore> = Arc::new(MemStore::default());
     let sid = store.create_session("overflow").await.unwrap();
     let agent = test_agent(provider, store.clone(), Arc::new(AllowAll), Some(sid));
+    // The system rules live in history (main.rs pushes them at index 0);
+    // they must survive the compaction round-trip.
+    agent
+        .context
+        .lock()
+        .await
+        .push(Message::system("stay terse; never force-push"));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let final_text = agent.run_turn("long task", tx).await.unwrap();
     assert_eq!(final_text, "recovered");
     assert_eq!(mock.calls.load(Ordering::SeqCst), 3, "overflow + summarize + retry");
+
+    // The retried request (index 2) must still carry the system rules —
+    // compaction pins them instead of summarizing them away.
+    let reqs = mock.requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 3);
+    assert!(
+        matches!(&reqs[2][0], Message::System { content } if content.contains("never force-push")),
+        "system rules lost after compaction: {:?}",
+        reqs[2].first()
+    );
 
     let mut saw_compaction = false;
     while let Ok(ev) = rx.try_recv() {

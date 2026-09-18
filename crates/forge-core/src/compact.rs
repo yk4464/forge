@@ -3,11 +3,18 @@
 //!
 //! - threshold = min(config, floor(effective_window * 0.90)) — computed on
 //!   the effective (95%) window, avoiding the #40095 mismatch
-//! - compaction replaces history with: recent user messages (greedy,
-//!   newest-first, 20k-token budget, tail truncated) + summary at the end
+//! - compaction replaces history with: pinned system rules + recent user
+//!   messages (greedy, newest-first, 20k-token budget, tail truncated) +
+//!   summary at the end; assistant/tool messages survive only via the
+//!   summary, so the replacement is always protocol-valid (no dangling
+//!   tool calls, no orphan tool results)
+//! - an in-flight tool group at the tail (assistant whose calls are not
+//!   all answered) is pinned after the summary, so results that arrive
+//!   after compaction still pair with their caller
 //! - stale summaries are recognized and excluded from the retained set
-//! - if the summarization request itself overflows, drop the oldest item
-//!   (with its paired tool output) and retry
+//! - if the summarization request itself overflows, drop the oldest
+//!   atomic group (never splitting a tool call/result pair, system rules
+//!   last) and retry
 //!
 //! Use compaction::SUMMARY_PREFIX as the marker for summary messages.
 
@@ -106,13 +113,60 @@ fn retained_user_messages(history: &[Message], budget: i64) -> Vec<Message> {
         .collect()
 }
 
-/// Build the replacement history (codex build_compacted_history): retained
-/// user messages first, summary last.
+/// Build the replacement history (codex build_compacted_history, adapted):
+/// system rules pinned first, retained recent user messages, then the
+/// summary. Assistant and tool messages survive only through the summary —
+/// the replacement never contains a dangling tool call or an orphan tool
+/// result. An in-flight tool group at the tail is pinned after the summary
+/// so results pushed after compaction still pair with their caller.
 pub fn build_compacted_history(history: &[Message], summary_text: &str) -> Vec<Message> {
-    let mut new_items = retained_user_messages(history, COMPACT_USER_MESSAGE_MAX_TOKENS);
+    let mut new_items: Vec<Message> = history
+        .iter()
+        .filter(|m| matches!(m, Message::System { .. }))
+        .cloned()
+        .collect();
+    new_items.extend(retained_user_messages(history, COMPACT_USER_MESSAGE_MAX_TOKENS));
     let summary = format!("{SUMMARY_PREFIX}\n{summary_text}");
     new_items.push(Message::User { content: summary });
+    if let Some(group) = trailing_incomplete_tool_group(history) {
+        new_items.extend(group);
+    }
     new_items
+}
+
+/// The tail of `history` is an in-flight tool group when it ends with an
+/// assistant message some of whose tool calls have no result yet — possible
+/// with mid-batch compaction between per-tool checks, or a turn that ended
+/// mid-batch. Returns the group (assistant plus the results already
+/// present) to pin at the end of the replacement history. A *complete*
+/// trailing group returns None: its content is covered by the summary.
+fn trailing_incomplete_tool_group(history: &[Message]) -> Option<Vec<Message>> {
+    let mut results_rev: Vec<&Message> = Vec::new();
+    let mut i = history.len();
+    while i > 0 {
+        i -= 1;
+        match &history[i] {
+            Message::ToolResult { .. } => results_rev.push(&history[i]),
+            Message::Assistant { tool_calls, .. } => {
+                let answered: std::collections::HashSet<&str> = results_rev
+                    .iter()
+                    .filter_map(|m| match m {
+                        Message::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let incomplete = tool_calls.iter().any(|c| !answered.contains(c.id.as_str()));
+                if !incomplete {
+                    return None;
+                }
+                let mut group = vec![history[i].clone()];
+                group.extend(results_rev.into_iter().rev().cloned());
+                return Some(group);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn tool_specs() -> Vec<ToolSpec> {
@@ -176,15 +230,41 @@ async fn summarize(
     }
 }
 
-/// Handle an overflow-style provider error during compaction by shrinking
-/// the input. Called by the driver below.
-fn shrink_for_overflow(msgs: &mut Vec<Message>) -> bool {
-    if msgs.len() > 1 {
-        msgs.remove(0);
-        true
-    } else {
-        false
+/// Drop the oldest atomic group from the summarization input on overflow.
+/// Groups are: a plain user message, or an assistant together with ALL of
+/// its trailing tool results (never split — an orphan tool_result would be
+/// rejected by protocol-level validation and confuses the summary). System
+/// rules are dropped last: only when nothing but system messages and the
+/// final prompt remain. Returns false when nothing can be removed.
+fn shrink_one_group(msgs: &mut Vec<Message>) -> bool {
+    if msgs.len() <= 1 {
+        return false;
     }
+    let last = msgs.len() - 1;
+    let start = match msgs.iter().position(|m| !matches!(m, Message::System { .. })) {
+        Some(i) if i < last => i,
+        _ => {
+            // Only system messages precede the prompt: drop the oldest
+            // system message as a last resort.
+            if matches!(msgs[0], Message::System { .. }) {
+                msgs.remove(0);
+                return true;
+            }
+            return false;
+        }
+    };
+    let end = match &msgs[start] {
+        Message::Assistant { .. } => {
+            let mut e = start + 1;
+            while e < last && matches!(msgs[e], Message::ToolResult { .. }) {
+                e += 1;
+            }
+            e
+        }
+        _ => start + 1,
+    };
+    msgs.drain(start..end);
+    true
 }
 
 /// Drive compaction: build the summarization input from the current history,
@@ -225,7 +305,7 @@ pub async fn run_compaction(
             // Drop oldest until the summarization request fits.
             let mut shrunk = input.clone();
             loop {
-                if !shrink_for_overflow(&mut shrunk) {
+                if !shrink_one_group(&mut shrunk) {
                     return Err(e);
                 }
                 match summarize(
@@ -284,6 +364,7 @@ pub fn message_is_summary(msg: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::ToolCall;
 
     #[test]
     fn truncate_middle_keeps_head_and_tail() {
@@ -331,8 +412,10 @@ mod tests {
             Message::user("q2"),
         ];
         let out = build_compacted_history(&history, "the summary");
-        assert_eq!(out.len(), 3); // q1, q2, summary — system+assistant dropped
-        assert!(matches!(out[0], Message::User { .. }));
+        // System rules pinned first, retained users kept, summary last.
+        assert_eq!(out.len(), 4);
+        assert!(matches!(&out[0], Message::System { content } if content == "sys"));
+        assert!(matches!(out.last().unwrap(), Message::User { .. }));
         match out.last().unwrap() {
             Message::User { content } => {
                 assert!(content.starts_with(SUMMARY_PREFIX));
@@ -340,6 +423,188 @@ mod tests {
             }
             _ => panic!("summary must be a user message"),
         }
+    }
+
+    #[test]
+    fn system_rules_survive_compaction() {
+        // Regression (S0): compaction used to drop System messages, so the
+        // agent lost its rules after the first compaction.
+        let history = vec![
+            Message::system("You must never force-push."),
+            Message::user("q1"),
+            Message::user("q2"),
+        ];
+        let out = build_compacted_history(&history, "s");
+        assert_eq!(out.len(), 4);
+        assert!(
+            matches!(&out[0], Message::System { content } if content.contains("never force-push")),
+            "system rules must be pinned, got {:?}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn tool_calls_and_results_never_survive_into_replacement() {
+        // Retention keeps only plain user messages: a tool result without
+        // its caller is rejected by provider-side validation (Anthropic
+        // requires tool_result blocks to follow their tool_use), and a
+        // dangling tool_use is equally invalid.
+        let history = vec![
+            Message::user("q1"),
+            Message::Assistant {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                content: "out".into(),
+                is_error: false,
+            },
+            Message::user("q2"),
+        ];
+        let out = build_compacted_history(&history, "s");
+        assert!(
+            out.iter().all(|m| !matches!(m, Message::ToolResult { .. })),
+            "orphan tool result survived: {out:?}"
+        );
+        assert!(
+            out.iter().all(|m| !matches!(m, Message::Assistant { .. })),
+            "dangling assistant survived: {out:?}"
+        );
+    }
+
+    #[test]
+    fn incomplete_tool_group_is_pinned_after_summary() {
+        // Regression (S0): mid-batch compaction between per-tool checks —
+        // the assistant asked for c1+c2, only c1's result exists. The group
+        // must be pinned after the summary so c2's result, pushed after
+        // compaction, still pairs with its caller.
+        let history = vec![
+            Message::system("sys"),
+            Message::user("q"),
+            Message::Assistant {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![
+                    ToolCall { id: "c1".into(), name: "shell".into(), arguments: serde_json::json!({}) },
+                    ToolCall { id: "c2".into(), name: "shell".into(), arguments: serde_json::json!({}) },
+                ],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                content: "r1".into(),
+                is_error: false,
+            },
+        ];
+        let out = build_compacted_history(&history, "s");
+        let n = out.len();
+        assert!(matches!(&out[n - 3], Message::User { content } if content.starts_with(SUMMARY_PREFIX)));
+        match &out[n - 2] {
+            Message::Assistant { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 2);
+                assert!(tool_calls.iter().any(|c| c.id == "c2"), "caller must be pinned");
+            }
+            other => panic!("expected pinned assistant, got {other:?}"),
+        }
+        match &out[n - 1] {
+            Message::ToolResult { tool_call_id, content, .. } => {
+                assert_eq!(tool_call_id, "c1");
+                assert_eq!(content, "r1");
+            }
+            other => panic!("expected pinned result, got {other:?}"),
+        }
+        assert!(!has_orphan_tool_result(&out));
+    }
+
+    #[test]
+    fn complete_tool_group_is_not_pinned() {
+        let history = vec![
+            Message::user("q"),
+            Message::Assistant {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                content: "r1".into(),
+                is_error: false,
+            },
+        ];
+        let out = build_compacted_history(&history, "s");
+        assert!(out.iter().all(|m| !matches!(m, Message::Assistant { .. })));
+        assert!(out.iter().all(|m| !matches!(m, Message::ToolResult { .. })));
+    }
+
+    fn has_orphan_tool_result(msgs: &[Message]) -> bool {
+        let mut answered = std::collections::HashSet::new();
+        for m in msgs {
+            match m {
+                Message::Assistant { tool_calls, .. } => {
+                    for c in tool_calls {
+                        answered.insert(c.id.clone());
+                    }
+                }
+                Message::ToolResult { tool_call_id, .. } => {
+                    if !answered.contains(tool_call_id) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn shrink_never_splits_tool_pairs_and_keeps_system_last() {
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::user("q1"),
+            Message::Assistant {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![
+                    ToolCall { id: "c1".into(), name: "shell".into(), arguments: serde_json::json!({}) },
+                    ToolCall { id: "c2".into(), name: "shell".into(), arguments: serde_json::json!({}) },
+                ],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                content: "r1".into(),
+                is_error: false,
+            },
+            Message::user(SUMMARIZATION_PROMPT),
+        ];
+        // Shrink until only the prompt remains: at no point may an orphan
+        // tool result appear, and the system rules must go last.
+        let mut steps = 0;
+        while msgs.len() > 1 {
+            assert!(!has_orphan_tool_result(&msgs), "orphan at len {}", msgs.len());
+            assert!(shrink_one_group(&mut msgs), "shrink must make progress");
+            steps += 1;
+            assert!(steps < 10, "shrink did not converge");
+        }
+        assert!(matches!(&msgs[0], Message::User { content } if content.starts_with(SUMMARIZATION_PROMPT)));
+    }
+
+    #[test]
+    fn shrink_progress_and_termination() {
+        // [system, prompt]: the system message is the only removable item;
+        // the prompt itself is never removed.
+        let mut msgs = vec![Message::system("sys"), Message::user(SUMMARIZATION_PROMPT)];
+        assert!(shrink_one_group(&mut msgs));
+        assert_eq!(msgs.len(), 1);
+        assert!(!shrink_one_group(&mut msgs));
     }
 
     #[test]
