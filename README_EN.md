@@ -1,19 +1,19 @@
 # forge
 
-⚡ A streaming-first terminal coding agent written in Rust (Milestone 1).
+⚡ A streaming-first terminal coding agent written in Rust (v0.0.1 prototype).
 
 English | [中文](README.md)
 
-forge runs in your terminal: you give instructions in natural language, it executes commands through a single `shell` tool (read/write files, search, build, run tests…), streams its reasoning and output live, and keeps going until the task is done. When the context approaches the model's window, it auto-compacts (Codex-style) so long sessions keep working.
+forge runs in your terminal: you give instructions in natural language, it executes commands through a single `shell` tool (read/write files, search, build, run tests…), streams model text and reasoning, displays tool results, and keeps going until the task is done. When the context approaches the model's window, it auto-compacts (Codex-style). Known gaps and the planned fixes are tracked in [ROADMAP.md](ROADMAP.md).
 
 ## Features
 
-- **Streaming-first** — assistant text, chain-of-thought, and tool output all flow through a unified `AgentEvent` bus; the Ratatui TUI renders them as they arrive
+- **Streaming event interface** — assistant text, reasoning, and tool events drive the Ratatui TUI through `AgentEvent`; shell incremental output forwarding still needs the S0 fix
 - **Three wire protocols, one trait** — `/v1/chat/completions` (OpenAI-compatible: DeepSeek, Zhipu, Qwen, …), `/v1/responses`, and `/v1/messages` (Anthropic format); all SSE-streamed, with `reasoning_content` / `thinking` surfaced as separate events
 - **Codex-style context compaction** — token accounting (local estimate anchored by API usage), dual checkpoints (pre-turn and after every tool output), automatic history compaction past the threshold; `/compact` triggers it manually
-- **One shell tool to rule them all** — commands run via Git Bash with live output streaming, timeout control (120s default / 600s max), and a 1 MiB capture cap with middle truncation
+- **Shell tool** — Git Bash execution, timeout control (120s default / 600s max), and result truncation; live output forwarding and bounded capture memory have known gaps scheduled for S0
 - **SQLite session persistence** — WAL mode; `/resume` restores sessions, memory survives across processes
-- **Extensible kernel** — `ModelProvider` / `Tool` / `Skill` / `Hook` / `Permission` are all traits behind registries; the permission layer is allow-all for now, with the architecture in place
+- **Extensible kernel** — Provider, Tool, Registry, session-storage, and permission interfaces are in place; permissions currently allow all operations, while complete Skills / Hooks contracts and implementations are planned
 
 ## Architecture
 
@@ -63,12 +63,18 @@ See [config.example.toml](config.example.toml) — every field is commented: pro
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for the full feature map (unscheduled). Overview:
+See [ROADMAP.md](ROADMAP.md) for the full feature map, dependencies, implementation order, and acceptance criteria. These stages do not promise calendar dates. v0.0.1 provides the agent loop, TUI, three protocols, SQLite, and basic context compaction; known gaps are addressed starting in S0.
 
-- [x] M1: agent loop + TUI + three protocols + SQLite + context compaction
-- [ ] File edit/search tools, permissions & sandbox, MCP, Skills, Hooks
-- [ ] Sub-agents & cross-terminal collaboration, image input, model fallback/OAuth/usage stats
-- [ ] Web UI (Axum + React), Tauri 2 desktop app
+- [ ] **S0 Baseline fixes**: shell streaming and memory bounds, error completion, compaction message integrity
+- [ ] **S1 Runtime and data reliability**: cancellation, original records, crash recovery, task budgets, runtime interfaces
+- [ ] **S2 Safe coding workflow**: permissions and workspace boundaries, file tools, project rules, planning and rewind
+- [ ] **S3 Daily usability**: Provider recovery, sessions and TUI, context and usage, scripting interface, basic release packages
+- [ ] **S4 Extension ecosystem**: Skills, MCP, Hooks, background tasks, and web tools
+- [ ] **S5 Multi-agent collaboration**: worktrees, sub-agents, and cross-terminal messaging
+- [ ] **S6 Multiple clients**: Web UI (Axum + React) and Tauri 2 desktop app
+- [ ] **S7 Optional enhancements**: LSP, PTY, OAuth/subscription quotas, additional platforms, and automatic updates
+
+S5 and S6 can be reordered as needed. Runtime interfaces are introduced in S1; testing and evaluation accompany every stage.
 
 ## License
 
