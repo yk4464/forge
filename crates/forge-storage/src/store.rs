@@ -10,6 +10,11 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
+/// Schema version recorded in `PRAGMA user_version`. v1 is the original
+/// shape (sessions/messages/session_meta); v0 means a database written by
+/// a build older than version stamping — same shape, just unstamped.
+pub const SCHEMA_VERSION: i32 = 1;
+
 /// SQLite-backed SessionStore. Messages are stored as serde-JSON of the
 /// canonical Message enum, so schema changes never lose transcripts.
 pub struct SqliteSessionStore {
@@ -38,7 +43,25 @@ impl SqliteSessionStore {
         Ok(store)
     }
 
+    /// Current `PRAGMA user_version` of the opened database.
+    pub async fn schema_version(&self) -> Result<i32> {
+        let row = sqlx::query("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(row.get("user_version"))
+    }
+
     async fn migrate(&self) -> Result<()> {
+        // Never touch a database written by a NEWER forge: its schema may
+        // carry shapes we would silently misread (downgrade protection).
+        let version = self.schema_version().await?;
+        if version > SCHEMA_VERSION {
+            return Err(Error::Storage(format!(
+                "database schema v{version} was written by a newer forge; \
+                 upgrade forge or restore a backup"
+            )));
+        }
         sqlx::raw_sql(
             r#"
 CREATE TABLE IF NOT EXISTS sessions (
@@ -66,6 +89,14 @@ CREATE TABLE IF NOT EXISTS session_meta (
         .execute(&self.pool)
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
+        // Stamp the version only after the (idempotent) migration ran, so
+        // a crash mid-migrate leaves the database unstamped and retried.
+        if version < SCHEMA_VERSION {
+            sqlx::raw_sql(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -337,5 +368,69 @@ mod tests {
         let loaded = store.load_messages(sid).await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert!(matches!(&loaded[0], Message::User { content } if content == "c"));
+    }
+
+    /// Open a raw pool to the same file (test helper for version stamps).
+    async fn raw_pool(path: &Path) -> Pool<Sqlite> {
+        let url = format!("sqlite://{}", path.display().to_string().replace('\\', "/"));
+        let opts = SqliteConnectOptions::from_str(&url).unwrap().create_if_missing(true);
+        SqlitePoolOptions::new().connect_with(opts).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn fresh_open_stamps_schema_version() {
+        let store = memory_store().await;
+        assert_eq!(store.schema_version().await.unwrap(), SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn newer_schema_version_refuses_to_open() {
+        let dir = std::env::temp_dir().join(format!("forge-test-{}", Uuid::new_v4()));
+        let path = dir.join("test.db");
+        {
+            let _store = SqliteSessionStore::open(&path).await.unwrap();
+        }
+        // Simulate a database written by a newer forge.
+        let raw = raw_pool(&path).await;
+        sqlx::raw_sql(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 7))
+            .execute(&raw)
+            .await
+            .unwrap();
+        raw.close().await;
+
+        let err = match SqliteSessionStore::open(&path).await {
+            Err(e) => e,
+            Ok(_) => panic!("open must refuse a newer schema"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer forge"),
+            "must refuse a newer schema, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_unstamped_db_is_stamped_without_data_loss() {
+        let dir = std::env::temp_dir().join(format!("forge-test-{}", Uuid::new_v4()));
+        let path = dir.join("test.db");
+        let sid = {
+            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let sid = store.create_session("legacy").await.unwrap();
+            store
+                .append_messages(sid, &[Message::user("kept")])
+                .await
+                .unwrap();
+            sid
+        };
+        // Rewind the stamp to simulate a pre-versioning database.
+        let raw = raw_pool(&path).await;
+        sqlx::raw_sql("PRAGMA user_version = 0").execute(&raw).await.unwrap();
+        raw.close().await;
+
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        assert_eq!(store.schema_version().await.unwrap(), SCHEMA_VERSION);
+        let loaded = store.load_messages(sid).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(&loaded[0], Message::User { content } if content == "kept"));
     }
 }

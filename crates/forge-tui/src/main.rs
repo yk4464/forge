@@ -434,9 +434,13 @@ async fn build_agent(
     context.push(Message::system(SYSTEM_PROMPT));
     let mut effective_sid = session_id;
     let mut warning = None;
+    let mut stored_len = 0usize;
+    let mut load_ok = false;
     if let Some(sid) = session_id {
         match store.load_messages(sid).await {
             Ok(msgs) => {
+                load_ok = true;
+                stored_len = msgs.len();
                 for m in msgs {
                     // Skip persisted system prompts; ours is fresh above.
                     if matches!(m, Message::System { .. }) {
@@ -457,6 +461,26 @@ async fn build_agent(
             }
         }
     }
+    // Align the append counter with the stored transcript. The rebuilt
+    // history normally has exactly as many items as stored rows (the
+    // persisted system row is skipped and ours is fresh); a mismatch means
+    // legacy shapes — rewrite once so appends stay aligned, or drop to
+    // read-only if even that fails.
+    let ctx_len = context.history.len();
+    if load_ok && ctx_len != stored_len {
+        if let Some(sid) = effective_sid {
+            let snapshot = context.history.snapshot();
+            match store.replace_messages(sid, &snapshot).await {
+                Ok(()) => {}
+                Err(e) => {
+                    warning = Some(format!(
+                        "transcript resync failed ({e}); this conversation runs without saving — the original transcript is untouched"
+                    ));
+                    effective_sid = None;
+                }
+            }
+        }
+    }
     (
         Arc::new(Agent {
             provider: provider.clone(),
@@ -469,6 +493,9 @@ async fn build_agent(
             temperature: cfg.model.temperature,
             max_tokens: cfg.model.max_tokens,
             session_id: effective_sid,
+            persisted_len: std::sync::atomic::AtomicUsize::new(ctx_len),
+            history_replaced: std::sync::atomic::AtomicBool::new(false),
+            persist_failed: std::sync::atomic::AtomicBool::new(false),
         }),
         warning,
     )

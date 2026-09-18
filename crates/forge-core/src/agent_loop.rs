@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures::StreamExt;
 use tokio::sync::{mpsc, Mutex};
@@ -27,6 +28,16 @@ pub struct Agent {
     pub max_tokens: u32,
     /// Session id for persistence; None = ephemeral.
     pub session_id: Option<uuid::Uuid>,
+    /// How many history items are already stored. Growth appends; a
+    /// shrunken history (compaction) triggers one full replace.
+    pub persisted_len: AtomicUsize,
+    /// Set after compaction replaces the history object: the next persist
+    /// must rewrite the transcript (content changed even if the length
+    /// did not shrink), and only a successful rewrite clears it.
+    pub history_replaced: AtomicBool,
+    /// Set while transcript writes are failing, so the user gets one
+    /// clear warning per failure streak instead of log-line spam.
+    pub persist_failed: AtomicBool,
 }
 
 impl Agent {
@@ -78,7 +89,7 @@ impl Agent {
         self.maybe_compact(events, cancel).await?;
 
         self.context.lock().await.push(Message::user(user_input));
-        self.persist_new_items().await;
+        self.persist_state(Some(events)).await;
 
         send(AgentEvent::TurnStarted);
 
@@ -94,7 +105,7 @@ impl Agent {
             let attempt = self.one_model_attempt(events, &mut turn_usage, cancel).await;
             match attempt {
                 Ok(Some(text)) => {
-                    self.persist_new_items().await;
+                    self.persist_state(Some(events)).await;
                     return Ok((text, turn_usage));
                 }
                 Ok(None) => {} // tools ran; issue the next model request
@@ -114,13 +125,11 @@ impl Agent {
                         events,
                     )
                     .await?;
-                    if let Some(sid) = self.session_id {
-                        let msgs = self.context.lock().await.history.snapshot();
-                        self.store
-                            .replace_messages(sid, &msgs)
-                            .await
-                            .map_err(|e| Error::Storage(e.to_string()))?;
-                    }
+                    // The history object was rebuilt: the next persist must
+                    // rewrite the transcript (content changed even when the
+                    // compacted history is not shorter).
+                    self.history_replaced.store(true, Ordering::Relaxed);
+                    self.persist_state(Some(events)).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -229,7 +238,7 @@ impl Agent {
             tool_calls: calls.clone(),
         };
         self.context.lock().await.push(assistant);
-        self.persist_new_items().await;
+        self.persist_state(Some(events)).await;
 
         if calls.is_empty() {
             return Ok(Some(text));
@@ -260,7 +269,7 @@ impl Agent {
                         output: "cancelled by user".into(),
                     });
                 }
-                self.persist_new_items().await;
+                self.persist_state(Some(events)).await;
                 return Err(Error::Cancelled);
             }
 
@@ -279,7 +288,7 @@ impl Agent {
                     content: refusal.clone(),
                     is_error: true,
                 });
-                self.persist_new_items().await;
+                self.persist_state(Some(events)).await;
                 send(AgentEvent::ToolCallCompleted {
                     call_id: call.id.clone(),
                     exit_code: None,
@@ -362,7 +371,7 @@ impl Agent {
                 content,
                 is_error,
             });
-            self.persist_new_items().await;
+            self.persist_state(Some(events)).await;
 
             // Mid-turn compaction check after every tool output
             // (avoids the codex #16033 between-turns-only bug).
@@ -392,12 +401,15 @@ impl Agent {
             events,
         )
         .await?;
+        // Manual /compact reports storage failure as an error (explicit
+        // user command), but still resyncs the append counter on success.
         if let Some(sid) = self.session_id {
             let msgs = self.context.lock().await.history.snapshot();
             self.store
                 .replace_messages(sid, &msgs)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
+            self.persisted_len.store(msgs.len(), Ordering::Relaxed);
         }
         Ok((before, after))
     }
@@ -429,25 +441,55 @@ impl Agent {
             events,
         )
         .await?;
-        // Replace persisted transcript to match compacted history.
-        if let Some(sid) = self.session_id {
-            let msgs = self.context.lock().await.history.snapshot();
-            self.store
-                .replace_messages(sid, &msgs)
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?;
-        }
+        // The history object was rebuilt: the next persist must rewrite
+        // the transcript (content changed even when the compacted history
+        // is not shorter).
+        self.history_replaced.store(true, Ordering::Relaxed);
+        self.persist_state(Some(events)).await;
         let _ = (before, after);
         Ok(())
     }
 
-    /// Persist items not yet saved. We track by comparing against the last
-    /// persisted count stored in session meta.
-    async fn persist_new_items(&self) {
-        if let Some(sid) = self.session_id {
-            let msgs = self.context.lock().await.history.snapshot();
-            if let Err(e) = self.store.replace_messages(sid, &msgs).await {
+    /// Persist the transcript: append-only while history grows, one full
+    /// replace when compaction shrank it. Storage failures surface once
+    /// per streak as a user-visible Warning — saving must never fail
+    /// silently, and recovery is announced too.
+    async fn persist_state(
+        &self,
+        events: Option<&mpsc::UnboundedSender<AgentEvent>>,
+    ) {
+        let Some(sid) = self.session_id else { return };
+        let msgs = self.context.lock().await.history.snapshot();
+        let persisted = self.persisted_len.load(Ordering::Relaxed);
+        let force_replace = self.history_replaced.load(Ordering::Relaxed);
+        let result = if !force_replace && msgs.len() >= persisted {
+            self.store.append_messages(sid, &msgs[persisted..]).await
+        } else {
+            self.store.replace_messages(sid, &msgs).await
+        };
+        match result {
+            Ok(()) => {
+                self.persisted_len.store(msgs.len(), Ordering::Relaxed);
+                self.history_replaced.store(false, Ordering::Relaxed);
+                if self.persist_failed.swap(false, Ordering::Relaxed) {
+                    if let Some(ev) = events {
+                        let _ = ev.send(AgentEvent::Warning {
+                            message: "transcript saving recovered".into(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
                 tracing::error!("persist failed: {e}");
+                if !self.persist_failed.swap(true, Ordering::Relaxed) {
+                    if let Some(ev) = events {
+                        let _ = ev.send(AgentEvent::Warning {
+                            message: format!(
+                                "transcript saving failed: {e} — the conversation continues but is not being saved"
+                            ),
+                        });
+                    }
+                }
             }
         }
     }

@@ -124,14 +124,17 @@ impl Tool for EchoTool {
     }
 }
 
-/// In-memory session store. Counts replace calls so tests can assert that
-/// a readonly agent never overwrites the stored transcript.
+/// In-memory session store. Counts append/replace calls so tests can
+/// assert that growth is persisted incrementally and a readonly agent
+/// never overwrites the stored transcript.
 #[derive(Default)]
 struct MemStore {
     sessions: Mutex<Vec<uuid::Uuid>>,
     msgs: Mutex<Vec<(uuid::Uuid, Vec<Message>)>>,
     replaces: AtomicUsize,
+    appends: AtomicUsize,
     load_fails: std::sync::atomic::AtomicBool,
+    append_fails: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -166,7 +169,15 @@ impl SessionStore for MemStore {
         session_id: uuid::Uuid,
         msgs: &[Message],
     ) -> forge_core::Result<()> {
-        self.replace_messages(session_id, msgs).await
+        if self.append_fails.load(Ordering::SeqCst) {
+            return Err(forge_core::Error::Storage("simulated append failure".into()));
+        }
+        self.appends.fetch_add(1, Ordering::SeqCst);
+        let mut all = self.msgs.lock().unwrap();
+        if let Some(slot) = all.iter_mut().find(|(id, _)| *id == session_id) {
+            slot.1.extend_from_slice(msgs);
+        }
+        Ok(())
     }
     async fn replace_messages(
         &self,
@@ -232,6 +243,9 @@ fn test_agent(
         temperature: None,
         max_tokens: 1024,
         session_id,
+        persisted_len: std::sync::atomic::AtomicUsize::new(0),
+        history_replaced: std::sync::atomic::AtomicBool::new(false),
+        persist_failed: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -617,4 +631,56 @@ async fn cancel_mid_tool_ends_turn_and_keeps_history_valid() {
         "second request must include the cancelled result: {:?}",
         reqs[1]
     );
+}
+
+#[tokio::test]
+async fn persistence_is_append_mostly_and_failures_are_visible() {
+    // Regression (S1 §13): a normal turn must grow the transcript with
+    // appends only — the old code deleted and rewrote every row on every
+    // message, so a crash mid-rewrite could truncate the session.
+    let mock = Arc::new(MockProvider::new(two_turn_script()));
+    let provider: Arc<dyn ModelProvider> = mock.clone();
+    let mem = Arc::new(MemStore::default());
+    let store: Arc<dyn SessionStore> = mem.clone();
+    let sid = store.create_session("incr").await.unwrap();
+    let agent = test_agent(provider, store.clone(), Arc::new(AllowAll), Some(sid));
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn("do the thing", tx, &CancelHandle::default().token())
+        .await
+        .unwrap();
+
+    assert!(
+        mem.appends.load(Ordering::SeqCst) >= 1,
+        "growth must persist via appends"
+    );
+    assert_eq!(
+        mem.replaces.load(Ordering::SeqCst),
+        0,
+        "a normal turn must never rewrite the transcript"
+    );
+    let stored = store.load_messages(sid).await.unwrap();
+    assert!(
+        matches!(&stored[0], Message::User { content } if content == "do the thing"),
+        "transcript intact: {stored:?}"
+    );
+
+    // Storage failure: the turn still completes and the user sees a
+    // warning — saving must never fail silently.
+    mem.append_fails.store(true, Ordering::SeqCst);
+    let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn("again", tx2, &CancelHandle::default().token())
+        .await
+        .unwrap();
+    let mut saw_warning = false;
+    while let Ok(ev) = rx2.try_recv() {
+        if let AgentEvent::Warning { message } = ev {
+            if message.contains("not being saved") {
+                saw_warning = true;
+            }
+        }
+    }
+    assert!(saw_warning, "storage failure must surface as a Warning");
 }
