@@ -56,6 +56,11 @@ pub struct ContextConfig {
     /// Raw model context window in tokens.
     #[serde(default = "default_window")]
     pub context_window: i64,
+    /// Max completion tokens reserved when deriving the auto-compact
+    /// threshold (kept in sync with the request budget so history +
+    /// completion always fit the raw window).
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
     /// Optional explicit auto-compact threshold; clamped to 90% of the
     /// effective window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +80,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             context_window: default_window(),
+            max_output_tokens: default_max_output_tokens(),
             auto_compact_token_limit: None,
             tool_output_max_bytes: default_tool_output_bytes(),
             shell_path: None,
@@ -85,6 +91,10 @@ impl Default for ContextConfig {
 
 fn default_window() -> i64 {
     128_000
+}
+
+fn default_max_output_tokens() -> u32 {
+    8192
 }
 
 fn default_tool_output_bytes() -> usize {

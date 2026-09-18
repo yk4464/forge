@@ -34,11 +34,34 @@ impl Agent {
     /// execute tool calls -> repeat until the model produces a final
     /// answer with no pending tool calls. Auto-compaction is checked
     /// pre-turn and after every tool output lands in history.
+    ///
+    /// Terminal-state guarantee: whatever the outcome (error, provider
+    /// failure, storage failure), an `AgentEvent::Error` is emitted before
+    /// `Err` is returned, and `TurnCompleted` closes every finished turn —
+    /// so UI consumers never stay stuck in a busy state.
     pub async fn run_turn(
         &self,
         user_input: &str,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<String> {
+        match self.run_turn_inner(user_input, &events).await {
+            Ok((text, usage)) => {
+                let _ = events.send(AgentEvent::TurnCompleted { usage });
+                Ok(text)
+            }
+            Err(e) => {
+                let _ = events.send(AgentEvent::Error { message: e.to_string() });
+                let _ = events.send(AgentEvent::TurnCompleted { usage: Usage::default() });
+                Err(e)
+            }
+        }
+    }
+
+    async fn run_turn_inner(
+        &self,
+        user_input: &str,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<(String, Usage)> {
         let send = |ev: AgentEvent| -> bool {
             events.send(ev).is_ok()
         };
@@ -50,7 +73,7 @@ impl Agent {
         }
 
         // Pre-turn compaction.
-        self.maybe_compact(&events).await?;
+        self.maybe_compact(events).await?;
 
         self.context.lock().await.push(Message::user(user_input));
         self.persist_new_items().await;
@@ -58,183 +81,236 @@ impl Agent {
         send(AgentEvent::TurnStarted);
 
         let mut turn_usage = Usage::default();
-        #[allow(unused_assignments)]
-        let mut final_text = String::new();
 
+        // One attempt = build request, stream response, run tools. On a
+        // context-window rejection we compact once and retry (bounded).
+        let mut overflow_retried = false;
         loop {
-            // ---- one model request ----
-            let (history, tool_specs) = {
-                let cm = self.context.lock().await;
-                let specs = self
-                    .tools
-                    .all()
-                    .iter()
-                    .map(|t| crate::traits::ToolSpec {
-                        name: t.name().to_string(),
-                        description: t.description().to_string(),
-                        parameters: t.parameters_schema(),
-                    })
-                    .collect::<Vec<_>>();
-                (cm.history.snapshot(), specs)
-            };
-
-            let req = crate::traits::ModelRequest {
-                messages: history,
-                tools: tool_specs,
-                model: self.model.clone(),
-                temperature: self.temperature,
-                max_tokens: self.max_tokens,
-                stream_reasoning: true,
-            };
-
-            let stream = self
-                .provider
-                .stream(req, &self.api_key)
-                .await
-                .map_err(|e| {
-                    send(AgentEvent::Error { message: e.to_string() });
-                    e
-                })?;
-            let mut stream = stream;
-
-            let mut text = String::new();
-            let mut calls: Vec<ToolCall> = Vec::new();
-
-            while let Some(ev) = stream.next().await {
-                match ev {
-                    crate::traits::ProviderEvent::MessageDelta { delta } => {
-                        text.push_str(&delta);
-                        send(AgentEvent::MessageDelta { delta });
-                    }
-                    crate::traits::ProviderEvent::ReasoningDelta { delta } => {
-                        send(AgentEvent::ReasoningDelta { delta });
-                    }
-                    crate::traits::ProviderEvent::ToolCallFragment { .. } => {
-                        // Providers reassemble fragments before the loop
-                        // sees them; defensive no-op.
-                    }
-                    crate::traits::ProviderEvent::ToolCalls { calls: c } => {
-                        calls.extend(c);
-                    }
-                    crate::traits::ProviderEvent::Usage { usage } => {
-                        turn_usage = usage;
-                        self.context.lock().await.record_usage(usage);
-                        let cm = self.context.lock().await;
-                        let (used, limit) = cm.token_status();
-                        drop(cm);
-                        send(AgentEvent::TokenCountUpdated { used, limit });
-                    }
-                    crate::traits::ProviderEvent::ProviderError { message } => {
-                        send(AgentEvent::Error { message: message.clone() });
-                        send(AgentEvent::TurnCompleted { usage: turn_usage });
-                        return Err(Error::Provider(message));
-                    }
-                    crate::traits::ProviderEvent::Done => break,
-                }
-            }
-
-            // Record the assistant message.
-            let assistant = Message::Assistant {
-                content: text.clone(),
-                reasoning: None,
-                tool_calls: calls.clone(),
-            };
-            self.context.lock().await.push(assistant);
-            self.persist_new_items().await;
-
-            if calls.is_empty() {
-                final_text = text;
-                break;
-            }
-
-            // ---- execute each tool call ----
-            for call in &calls {
-                let args_json = call.arguments.to_string();
-                if !self.permissions.approve(&call.name, &call.arguments).await {
-                    let refusal = format!("Permission denied for tool {0}", call.name);
-                    self.context.lock().await.push(Message::ToolResult {
-                        tool_call_id: call.id.clone(),
-                        content: refusal.clone(),
-                        is_error: true,
-                    });
+            let attempt = self.one_model_attempt(events, &mut turn_usage).await;
+            match attempt {
+                Ok(Some(text)) => {
                     self.persist_new_items().await;
-                    send(AgentEvent::ToolCallCompleted {
-                        call_id: call.id.clone(),
-                        exit_code: None,
-                        timed_out: false,
-                        duration_ms: 0,
-                        output: refusal,
-                    });
-                    continue;
+                    return Ok((text, turn_usage));
                 }
+                Ok(None) => {} // tools ran; issue the next model request
+                Err(Error::ContextWindowExceeded { .. }) if !overflow_retried => {
+                    overflow_retried = true;
+                    send(AgentEvent::Warning {
+                        message: "context window exceeded; compacting and retrying once".into(),
+                    });
+                    let provider = self.provider.clone();
+                    compact::run_compaction(
+                        &mut *self.context.lock().await,
+                        provider,
+                        &self.api_key,
+                        &self.model,
+                        self.temperature,
+                        self.max_tokens,
+                        events,
+                    )
+                    .await?;
+                    if let Some(sid) = self.session_id {
+                        let msgs = self.context.lock().await.history.snapshot();
+                        self.store
+                            .replace_messages(sid, &msgs)
+                            .await
+                            .map_err(|e| Error::Storage(e.to_string()))?;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 
+    /// One request -> stream -> (maybe) execute tools cycle. Returns
+    /// `Ok(None)` when tools ran and the outer loop should issue another
+    /// model request; `Ok(Some(text))` when the model produced a final
+    /// answer; `Err` bubbles provider/tool failures.
+    async fn one_model_attempt(
+        &self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        turn_usage: &mut Usage,
+    ) -> Result<Option<String>> {
+        let send = |ev: AgentEvent| -> bool {
+            events.send(ev).is_ok()
+        };
+        let (history, tool_specs) = {
+            let cm = self.context.lock().await;
+            let specs = self
+                .tools
+                .all()
+                .iter()
+                .map(|t| crate::traits::ToolSpec {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    parameters: t.parameters_schema(),
+                })
+                .collect::<Vec<_>>();
+            (cm.history.snapshot(), specs)
+        };
+
+        let req = crate::traits::ModelRequest {
+            messages: history,
+            tools: tool_specs,
+            model: self.model.clone(),
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            stream_reasoning: true,
+        };
+
+        let stream = self.provider.stream(req, &self.api_key).await?;
+        let mut stream = stream;
+
+
+        let mut text = String::new();
+        let mut calls: Vec<ToolCall> = Vec::new();
+
+        while let Some(ev) = stream.next().await {
+            match ev {
+                crate::traits::ProviderEvent::MessageDelta { delta } => {
+                    text.push_str(&delta);
+                    send(AgentEvent::MessageDelta { delta });
+                }
+                crate::traits::ProviderEvent::ReasoningDelta { delta } => {
+                    send(AgentEvent::ReasoningDelta { delta });
+                }
+                crate::traits::ProviderEvent::ToolCallFragment { .. } => {
+                    // Providers reassemble fragments before the loop
+                    // sees them; defensive no-op.
+                }
+                crate::traits::ProviderEvent::ToolCalls { calls: c } => {
+                    calls.extend(c);
+                }
+                crate::traits::ProviderEvent::Usage { usage } => {
+                    // Usage events are cumulative across a turn: each
+                    // response reports the whole prompt so far.
+                    turn_usage.input_tokens += usage.input_tokens;
+                    turn_usage.output_tokens += usage.output_tokens;
+                    turn_usage.total_tokens += usage.total_tokens;
+                    self.context.lock().await.record_usage(usage);
+                    let cm = self.context.lock().await;
+                    let (used, limit) = cm.token_status();
+                    drop(cm);
+                    send(AgentEvent::TokenCountUpdated { used, limit });
+                }
+                crate::traits::ProviderEvent::ProviderError { message } => {
+                    return Err(Error::Provider(message));
+                }
+                crate::traits::ProviderEvent::Done => break,
+            }
+        }
+
+        // An assistant response with neither text nor tool calls is an
+        // empty shell; keeping it would replay a contentless turn to the
+        // provider forever (some endpoints 400 on empty text blocks).
+        if text.is_empty() && calls.is_empty() {
+            return Ok(Some(String::new()));
+        }
+
+        // Record the assistant message.
+        let assistant = Message::Assistant {
+            content: text.clone(),
+            reasoning: None,
+            tool_calls: calls.clone(),
+        };
+        self.context.lock().await.push(assistant);
+        self.persist_new_items().await;
+
+        if calls.is_empty() {
+            return Ok(Some(text));
+        }
+
+        // ---- execute each tool call ----
+        for call in &calls {
+            let args_json = call.arguments.to_string();
+            if !self.permissions.approve(&call.name, &call.arguments).await {
+                let refusal = format!("Permission denied for tool {0}", call.name);
+                // Started/Completed must stay paired: UI consumers key
+                // completed cards off the started event.
                 send(AgentEvent::ToolCallStarted {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                     command: args_json.clone(),
                 });
-
-                let started = std::time::Instant::now();
-                let emitter = EventEmitter {
-                    call_id: call.id.clone(),
-                    events: events.clone(),
-                };
-                let result = match self.tools.get(&call.name) {
-                    Some(tool) => tool
-                        .execute(&call.id, call.arguments.clone(), &emitter)
-                        .await,
-                    None => Err(Error::Tool(format!("unknown tool: {}", call.name))),
-                };
-
-                let (content, is_error) = match result {
-                    Ok(out) => {
-                        send(AgentEvent::ToolCallCompleted {
-                            call_id: call.id.clone(),
-                            exit_code: out.exit_code,
-                            timed_out: out.timed_out,
-                            duration_ms: out.duration_ms,
-                            output: out.content.clone(),
-                        });
-                        let _ = started;
-                        (out.content, false)
-                    }
-                    Err(e) => {
-                        let msg = format!("tool error: {e}");
-                        send(AgentEvent::ToolCallCompleted {
-                            call_id: call.id.clone(),
-                            exit_code: None,
-                            timed_out: false,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            output: msg.clone(),
-                        });
-                        (msg, true)
-                    }
-                };
-
-                // Truncate to the configured per-output budget before it
-                // enters history (codex TruncationPolicy::Bytes).
-                let budget = {
-                    let cm = self.context.lock().await;
-                    cm.config().tool_output_max_bytes
-                };
-                let content = compact::truncate_middle_bytes(&content, budget);
-
                 self.context.lock().await.push(Message::ToolResult {
                     tool_call_id: call.id.clone(),
-                    content,
-                    is_error,
+                    content: refusal.clone(),
+                    is_error: true,
                 });
                 self.persist_new_items().await;
-
-                // Mid-turn compaction check after every tool output
-                // (avoids the codex #16033 between-turns-only bug).
-                self.maybe_compact(&events).await?;
+                send(AgentEvent::ToolCallCompleted {
+                    call_id: call.id.clone(),
+                    exit_code: None,
+                    timed_out: false,
+                    duration_ms: 0,
+                    output: refusal,
+                });
+                continue;
             }
+
+            send(AgentEvent::ToolCallStarted {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                command: args_json.clone(),
+            });
+
+            let started = std::time::Instant::now();
+            let emitter = EventEmitter {
+                call_id: call.id.clone(),
+                events: events.clone(),
+            };
+            let result = match self.tools.get(&call.name) {
+                Some(tool) => tool
+                    .execute(&call.id, call.arguments.clone(), &emitter)
+                    .await,
+                None => Err(Error::Tool(format!("unknown tool: {}", call.name))),
+            };
+
+            let (content, is_error) = match result {
+                Ok(out) => {
+                    send(AgentEvent::ToolCallCompleted {
+                        call_id: call.id.clone(),
+                        exit_code: out.exit_code,
+                        timed_out: out.timed_out,
+                        duration_ms: out.duration_ms,
+                        output: out.content.clone(),
+                    });
+                    (out.content, false)
+                }
+                Err(e) => {
+                    let msg = format!("tool error: {e}");
+                    send(AgentEvent::ToolCallCompleted {
+                        call_id: call.id.clone(),
+                        exit_code: None,
+                        timed_out: false,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        output: msg.clone(),
+                    });
+                    (msg, true)
+                }
+            };
+
+            // Truncate to the configured per-output budget before it
+            // enters history (codex TruncationPolicy::Bytes).
+            let budget = {
+                let cm = self.context.lock().await;
+                cm.config().tool_output_max_bytes
+            };
+            let content = compact::truncate_middle_bytes(&content, budget);
+
+            self.context.lock().await.push(Message::ToolResult {
+                tool_call_id: call.id.clone(),
+                content,
+                is_error,
+            });
+            self.persist_new_items().await;
+
+            // Mid-turn compaction check after every tool output
+            // (avoids the codex #16033 between-turns-only bug).
+            self.maybe_compact(events).await?;
         }
 
-        send(AgentEvent::TurnCompleted { usage: turn_usage });
-        self.persist_new_items().await;
-        Ok(final_text)
+        Ok(None)
     }
 
     /// Manual compaction entry (/compact): compact now regardless of the
@@ -270,8 +346,7 @@ impl Agent {
     async fn maybe_compact(
         &self,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> Result<()> {
-        let needed = {
+    ) -> Result<()> {        let needed = {
             let cm = self.context.lock().await;
             cm.should_compact()
         };
