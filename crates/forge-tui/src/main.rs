@@ -23,6 +23,50 @@ fn default_db_path() -> PathBuf {
     base.join(".forge").join("forge.db")
 }
 
+fn current_project_root() -> String {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Latest session belonging to this project. Sessions carry a
+/// `project_root` meta entry stamped at creation; explicit matches win,
+/// and entries without a marker (legacy, pre-isolation) are only used as
+/// a fallback so old histories stay reachable. `title` optionally narrows
+/// the search (used by `forge check`'s named check session).
+async fn latest_session_for_project(
+    store: &SqliteSessionStore,
+    project_root: &str,
+    title: Option<&str>,
+) -> anyhow::Result<Option<forge_core::session::SessionSummary>> {
+    let sessions = store.list_sessions(50).await?;
+    let mut legacy = None;
+    for s in sessions {
+        if let Some(t) = title {
+            if s.title != t {
+                continue;
+            }
+        }
+        match store.get_meta(s.id, "project_root").await {
+            Ok(Some(v)) => {
+                if v.as_str().map(|p| p.eq_ignore_ascii_case(project_root)).unwrap_or(false) {
+                    return Ok(Some(s));
+                }
+            }
+            Ok(None) => {
+                // Legacy session without a marker: remember the newest,
+                // but an explicit project match always wins.
+                if legacy.is_none() {
+                    legacy = Some(s);
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    Ok(legacy)
+}
+
 fn find_config() -> Option<PathBuf> {
     for p in ["forge.toml", "config.toml"] {
         let cwd = PathBuf::from(p);
@@ -71,15 +115,26 @@ async fn run_check(prompt: String) -> anyhow::Result<()> {
 
     let provider = forge_provider::from_config(&cfg.provider.protocol, &cfg.provider.base_url)?;
 
-    // Reuse the latest check session when present so consecutive
-    // `forge check` invocations form one continuous conversation; the
-    // agent then reloads the transcript from storage (memory test).
-    let sessions = store.list_sessions(50).await?;
-    let sid = match sessions.iter().find(|s| s.title == "check") {
+    // Reuse the latest check session for THIS project when present so
+    // consecutive `forge check` invocations form one continuous
+    // conversation without bleeding into other projects' history.
+    let project_root = current_project_root();
+    let sid = match latest_session_for_project(&store, &project_root, Some("check")).await? {
         Some(s) => s.id,
-        None => store.create_session("check").await?,
+        None => {
+            let id = store.create_session("check").await?;
+            let _ = store
+                .set_meta(id, "project_root", &serde_json::json!(project_root))
+                .await;
+            id
+        }
     };
-    let agent = build_agent(&cfg, &api_key, &tools, &store, &provider, Some(sid)).await;
+    let (agent, warning) = build_agent(&cfg, &api_key, &tools, &(store.clone() as Arc<dyn SessionStore>), &provider, Some(sid)).await;
+    if let Some(w) = warning {
+        // Never run a headless acceptance run against a transcript we
+        // could not read.
+        bail!("{w}");
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent2 = agent.clone();
@@ -149,6 +204,9 @@ async fn run_tui() -> anyhow::Result<()> {
 
     let db_path = default_db_path();
     let store = Arc::new(SqliteSessionStore::open(&db_path).await?);
+    // Trait-object view for build_agent; keep the concrete handle for
+    // session listing/creation helpers.
+    let store_dyn: Arc<dyn SessionStore> = store.clone();
 
     let shell = ShellTool::new(
         cfg.context.shell_path.clone().map(PathBuf::from),
@@ -189,86 +247,117 @@ async fn run_tui() -> anyhow::Result<()> {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     let submit = ui::on_key(&mut app, key);
-                    if submit && !app.busy {
-                        match app.on_submit() {
-                            CommandAction::Send(text) => {
-                                ensure_session(&mut app, &*store).await;
-                                if agent.is_none() {
-                                    agent = Some(
-                                        build_agent(
-                                            &cfg, &api_key, &tools, &store, &provider,
+                    if submit {
+                        let action = app.on_submit();
+                        // /exit must work even mid-turn: the agent task
+                        // outlives the UI loop and the process exits.
+                        if matches!(action, CommandAction::Exit) {
+                            app.should_quit = true;
+                        } else if !app.busy {
+                            match action {
+                                CommandAction::Send(text) => {
+                                    ensure_session(&mut app, &*store).await;
+                                    if agent.is_none() {
+                                        let (a, warning) = build_agent(
+                                            &cfg, &api_key, &tools, &store_dyn, &provider,
                                             app.session_id,
                                         )
-                                        .await,
-                                    );
-                                }
-                                if let Some(a) = &agent {
-                                    let (tx, rx) = mpsc::unbounded_channel();
-                                    let a = a.clone();
-                                    let text = text.clone();
-                                    app.busy = true;
-                                    tokio::spawn(async move {
-                                        if let Err(e) = a.run_turn(&text, tx).await {
-                                            let _ = AgentEvent::Error { message: e.to_string() };
+                                        .await;
+                                        if let Some(w) = warning {
+                                            app.push_line(app::Line::Error(w));
                                         }
-                                    });
-                                    events_rx = rx;
-                                }
-                            }
-                            CommandAction::NewSession => {
-                                app.session_id = None;
-                                app.lines.clear();
-                                app.session_title = "(new session)".into();
-                                app.status = "ready".into();
-                                agent = None; // fresh context next turn
-                                ensure_session(&mut app, &*store).await;
-                            }
-                            CommandAction::Resume => {
-                                let sessions = store.list_sessions(20).await?;
-                                if sessions.is_empty() {
-                                    app.push_line(app::Line::System(
-                                        "no saved sessions".into(),
-                                    ));
-                                } else {
-                                    let latest = &sessions[0];
-                                    app.load_session(&store, latest.id).await;
-                                    // Rebuild the agent with this session's
-                                    // history so conversation continuity works.
-                                    agent = Some(
-                                        build_agent(
-                                            &cfg, &api_key, &tools, &store, &provider,
-                                            app.session_id,
-                                        )
-                                        .await,
-                                    );
-                                }
-                            }
-                            CommandAction::Compact => {
-                                if agent.is_none() {
-                                    agent = Some(
-                                        build_agent(
-                                            &cfg, &api_key, &tools, &store, &provider,
-                                            app.session_id,
-                                        )
-                                        .await,
-                                    );
-                                }
-                                if let Some(a) = &agent {
-                                    let (tx, rx) = mpsc::unbounded_channel();
-                                    let a = a.clone();
-                                    events_rx = rx;
-                                    let res = a.compact_manual(&tx).await;
-                                    match res {
-                                        Ok((b, aft)) => {
-                                            app.push_line(app::Line::System(format!(
-                                                "manual compaction: ~{b} → ~{aft} tokens"
-                                            )));
-                                        }
-                                        Err(e) => app.push_line(app::Line::Error(e.to_string())),
+                                        agent = Some(a);
+                                    }
+                                    if let Some(a) = &agent {
+                                        let (tx, rx) = mpsc::unbounded_channel();
+                                        let a = a.clone();
+                                        let text = text.clone();
+                                        let tx_guard = tx.clone();
+                                        app.busy = true;
+                                        tokio::spawn(async move {
+                                            let inner = tokio::spawn(async move {
+                                                a.run_turn(&text, tx).await
+                                            });
+                                            // run_turn guarantees terminal
+                                            // events; this only catches a
+                                            // panicked agent task.
+                                            if let Err(join) = inner.await {
+                                                let _ = tx_guard.send(AgentEvent::Error {
+                                                    message: format!("agent task crashed: {join}"),
+                                                });
+                                            }
+                                        });
+                                        events_rx = rx;
                                     }
                                 }
+                                CommandAction::NewSession => {
+                                    app.session_id = None;
+                                    app.clear_transient();
+                                    app.session_title = "(new session)".into();
+                                    app.status = "ready".into();
+                                    agent = None; // fresh context next turn
+                                    ensure_session(&mut app, &*store).await;
+                                }
+                                CommandAction::Resume => {
+                                    let project_root = current_project_root();
+                                    match latest_session_for_project(
+                                        &*store, &project_root, None,
+                                    )
+                                    .await
+                                    {
+                                        Ok(None) => app.push_line(app::Line::System(
+                                            "no saved sessions for this project".into(),
+                                        )),
+                                        Ok(Some(s)) => {
+                                            app.load_session(&store, &s).await;
+                                            // Rebuild the agent with this session's
+                                            // history so conversation continuity works.
+                                            let (a, warning) = build_agent(
+                                                &cfg, &api_key, &tools, &store_dyn, &provider,
+                                                app.session_id,
+                                            )
+                                            .await;
+                                            if let Some(w) = warning {
+                                                app.push_line(app::Line::Error(w));
+                                            }
+                                            agent = Some(a);
+                                        }
+                                        Err(e) => {
+                                            app.push_line(app::Line::Error(format!(
+                                                "cannot list sessions: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                                CommandAction::Compact => {
+                                    if agent.is_none() {
+                                        let (a, warning) = build_agent(
+                                            &cfg, &api_key, &tools, &store_dyn, &provider,
+                                            app.session_id,
+                                        )
+                                        .await;
+                                        if let Some(w) = warning {
+                                            app.push_line(app::Line::Error(w));
+                                        }
+                                        agent = Some(a);
+                                    }
+                                    if let Some(a) = &agent {
+                                        let (tx, rx) = mpsc::unbounded_channel();
+                                        let a = a.clone();
+                                        events_rx = rx;
+                                        let res = a.compact_manual(&tx).await;
+                                        match res {
+                                            Ok((b, aft)) => {
+                                                app.push_line(app::Line::System(format!(
+                                                    "manual compaction: ~{b} → ~{aft} tokens"
+                                                )));
+                                            }
+                                            Err(e) => app.push_line(app::Line::Error(e.to_string())),
+                                        }
+                                    }
+                                }
+                                CommandAction::Exit | CommandAction::None => {}
                             }
-                            CommandAction::Exit | CommandAction::None => {}
                         }
                         if app.should_quit {
                             break;
@@ -303,18 +392,25 @@ fn bootstrap_agent_channel() -> mpsc::UnboundedReceiver<AgentEvent> {
     rx
 }
 
+/// Build the agent. Returns the agent plus an optional user-facing
+/// warning: when the stored transcript cannot be read, persistence is
+/// disabled (session id dropped) so a later `replace_messages` can never
+/// wipe a transcript we failed to load.
 async fn build_agent(
     cfg: &Config,
     api_key: &str,
     tools: &Registry<dyn forge_core::traits::Tool>,
-    store: &Arc<SqliteSessionStore>,
+    store: &Arc<dyn SessionStore>,
     provider: &Arc<dyn forge_core::traits::ModelProvider>,
     session_id: Option<uuid::Uuid>,
-) -> Arc<Agent> {
+) -> (Arc<Agent>, Option<String>) {
     let mut context = ContextManager::new(cfg.context.clone());
+    context.set_max_output_tokens(cfg.model.max_tokens as i64);
     // Seed the system prompt and restore the persisted transcript so the
     // agent remembers previous turns within this session.
     context.push(Message::system(SYSTEM_PROMPT));
+    let mut effective_sid = session_id;
+    let mut warning = None;
     if let Some(sid) = session_id {
         match store.load_messages(sid).await {
             Ok(msgs) => {
@@ -325,22 +421,34 @@ async fn build_agent(
                     }
                     context.push(m);
                 }
+                // Drop empty assistant shells / orphan tool results that
+                // older builds could have persisted; providers reject the
+                // empty shapes and replaying them breaks later turns.
+                context.history.normalize();
             }
-            Err(e) => tracing::warn!("cannot load session history: {e}"),
+            Err(e) => {
+                warning = Some(format!(
+                    "session history failed to load ({e}); this conversation runs without saving — the original transcript is untouched"
+                ));
+                effective_sid = None;
+            }
         }
     }
-    Arc::new(Agent {
-        provider: provider.clone(),
-        tools: clone_registry(tools),
-        store: store.clone(),
-        permissions: Arc::new(AllowAll),
-        context: tokio::sync::Mutex::new(context),
-        api_key: api_key.to_string(),
-        model: cfg.model.name.clone(),
-        temperature: cfg.model.temperature,
-        max_tokens: cfg.model.max_tokens,
-        session_id,
-    })
+    (
+        Arc::new(Agent {
+            provider: provider.clone(),
+            tools: clone_registry(tools),
+            store: store.clone(),
+            permissions: Arc::new(AllowAll),
+            context: tokio::sync::Mutex::new(context),
+            api_key: api_key.to_string(),
+            model: cfg.model.name.clone(),
+            temperature: cfg.model.temperature,
+            max_tokens: cfg.model.max_tokens,
+            session_id: effective_sid,
+        }),
+        warning,
+    )
 }
 
 const SYSTEM_PROMPT: &str = "\
@@ -362,10 +470,136 @@ async fn ensure_session(app: &mut App, store: &SqliteSessionStore) {
         let title = app.maybe_title(app.input.trim());
         match store.create_session(&title).await {
             Ok(id) => {
+                // Tag the session with the current project so /resume and
+                // `forge check` never mix histories across projects.
+                let root = current_project_root();
+                let _ = store
+                    .set_meta(id, "project_root", &serde_json::json!(root))
+                    .await;
                 app.session_id = Some(id);
                 app.session_title = title;
             }
             Err(e) => app.push_line(app::Line::Error(format!("session create failed: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_core::session::SessionStore;
+
+    struct FailingStore;
+
+    #[async_trait::async_trait]
+    impl SessionStore for FailingStore {
+        async fn create_session(&self, _t: &str) -> forge_core::Result<uuid::Uuid> {
+            Ok(uuid::Uuid::new_v4())
+        }
+        async fn list_sessions(
+            &self,
+            _: u32,
+        ) -> forge_core::Result<Vec<forge_core::session::SessionSummary>> {
+            Ok(vec![])
+        }
+        async fn load_messages(&self, _: uuid::Uuid) -> forge_core::Result<Vec<Message>> {
+            Err(forge_core::Error::Storage("corrupt payload".into()))
+        }
+        async fn append_messages(&self, _: uuid::Uuid, _: &[Message]) -> forge_core::Result<()> {
+            Ok(())
+        }
+        async fn replace_messages(&self, _: uuid::Uuid, _: &[Message]) -> forge_core::Result<()> {
+            Ok(())
+        }
+        async fn rename_session(&self, _: uuid::Uuid, _: &str) -> forge_core::Result<()> {
+            Ok(())
+        }
+        async fn set_meta(
+            &self,
+            _: uuid::Uuid,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> forge_core::Result<()> {
+            Ok(())
+        }
+        async fn get_meta(
+            &self,
+            _: uuid::Uuid,
+            _: &str,
+        ) -> forge_core::Result<Option<serde_json::Value>> {
+            Ok(None)
+        }
+    }
+
+    fn test_tools() -> Registry<dyn forge_core::traits::Tool> {
+        Registry::new()
+    }
+
+    fn test_provider() -> Arc<dyn forge_core::traits::ModelProvider> {
+        // Client construction only; no network is touched in this test.
+        forge_provider::from_config("openai", "http://127.0.0.1:9").unwrap()
+    }
+
+    #[tokio::test]
+    async fn corrupt_history_disables_persistence() {
+        let cfg = Config::default();
+        let api_key = cfg.resolve_api_key().unwrap_or_default();
+        let store: Arc<dyn SessionStore> = Arc::new(FailingStore);
+        let (agent, warning) = build_agent(
+            &cfg,
+            &api_key,
+            &test_tools(),
+            &store,
+            &test_provider(),
+            Some(uuid::Uuid::new_v4()),
+        )
+        .await;
+        assert!(warning.is_some(), "load failure must surface a warning");
+        assert_eq!(
+            agent.session_id, None,
+            "persistence must be disabled so the stored transcript is never overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_are_scoped_to_project_root() {
+        let dir = std::env::temp_dir().join(format!("forge-tui-test-{}", uuid::Uuid::new_v4()));
+        let store = SqliteSessionStore::open(&dir.join("t.db")).await.unwrap();
+        let sid_a = store.create_session("proj a").await.unwrap();
+        store
+            .set_meta(sid_a, "project_root", &serde_json::json!("D:/projA"))
+            .await
+            .unwrap();
+        let sid_b = store.create_session("proj b").await.unwrap();
+        store
+            .set_meta(sid_b, "project_root", &serde_json::json!("D:/projB"))
+            .await
+            .unwrap();
+        // Legacy session with no marker.
+        let sid_legacy = store.create_session("legacy").await.unwrap();
+
+        // Explicit marker wins even though the legacy session is newer.
+        let found = latest_session_for_project(&store, "D:/projA", None)
+            .await
+            .unwrap();
+        assert_eq!(found.map(|s| s.id), Some(sid_a));
+
+        // No marker on any match → legacy fallback keeps old data reachable.
+        let found = latest_session_for_project(&store, "D:/projC", None)
+            .await
+            .unwrap();
+        assert_eq!(found.map(|s| s.id), Some(sid_legacy));
+
+        // Title narrowing (forge check).
+        let sid_check = store.create_session("check").await.unwrap();
+        store
+            .set_meta(sid_check, "project_root", &serde_json::json!("D:/projA"))
+            .await
+            .unwrap();
+        let found = latest_session_for_project(&store, "D:/projA", Some("check"))
+            .await
+            .unwrap();
+        assert_eq!(found.map(|s| s.id), Some(sid_check));
+        let _ = (sid_b,);
     }
 }

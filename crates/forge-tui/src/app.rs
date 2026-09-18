@@ -38,7 +38,8 @@ pub struct App {
     pub busy: bool,
     pub session_id: Option<uuid::Uuid>,
     pub session_title: String,
-    pub scroll: u16,
+    /// Rows scrolled UP from the bottom; 0 = follow the newest output.
+    pub scroll_from_bottom: u16,
     /// Live buffers for the in-flight turn.
     pub streaming_assistant: String,
     pub streaming_reasoning: String,
@@ -56,7 +57,7 @@ impl App {
             busy: false,
             session_id: None,
             session_title: String::from("(new session)"),
-            scroll: 0,
+            scroll_from_bottom: 0,
             streaming_assistant: String::new(),
             streaming_reasoning: String::new(),
             open_tools: std::collections::HashMap::new(),
@@ -65,9 +66,17 @@ impl App {
         }
     }
 
+    /// Drop transcript + in-flight rendering state (used by /new).
+    pub fn clear_transient(&mut self) {
+        self.lines.clear();
+        self.streaming_assistant.clear();
+        self.streaming_reasoning.clear();
+        self.open_tools.clear();
+        self.scroll_from_bottom = 0;
+    }
+
     pub fn push_line(&mut self, line: Line) {
         self.lines.push(line);
-        self.scroll = 0;
     }
 
     /// Handle one event from the agent loop. Returns Some(summary text)
@@ -123,7 +132,10 @@ impl App {
             AgentEvent::TurnCompleted { .. } => {
                 self.busy = false;
                 self.flush_streaming();
-                self.status = "ready".into();
+                // Keep an error status visible; only normal turns reset it.
+                if !self.status.contains("error") {
+                    self.status = "ready".into();
+                }
             }
             AgentEvent::Error { message } => {
                 self.push_line(Line::Error(message));
@@ -175,8 +187,14 @@ impl App {
         CommandAction::Send(text)
     }
 
-    /// Load a session from the store into the transcript.
-    pub async fn load_session(&mut self, store: &SqliteSessionStore, id: uuid::Uuid) {
+    /// Load a session from the store into the transcript. The session's
+    /// own title is kept (falling back to the id when empty).
+    pub async fn load_session(
+        &mut self,
+        store: &SqliteSessionStore,
+        s: &forge_core::session::SessionSummary,
+    ) {
+        let id = s.id;
         match store.load_messages(id).await {
             Ok(msgs) => {
                 self.lines.clear();
@@ -209,7 +227,12 @@ impl App {
                     }
                 }
                 self.session_id = Some(id);
-                self.session_title = format!("session {id}");
+                let t = s.title.trim();
+                self.session_title = if t.is_empty() {
+                    format!("session {id}")
+                } else {
+                    t.to_string()
+                };
                 self.status = "resumed".into();
             }
             Err(e) => self.push_line(Line::Error(format!("load failed: {e}"))),
@@ -224,5 +247,34 @@ impl App {
         } else {
             t
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_command_is_recognized() {
+        let mut app = App::new();
+        app.input = "/exit".into();
+        assert!(matches!(app.on_submit(), CommandAction::Exit));
+        app.input = "/quit".into();
+        assert!(matches!(app.on_submit(), CommandAction::Exit));
+    }
+
+    #[test]
+    fn clear_transient_drops_streaming_state() {
+        let mut app = App::new();
+        app.lines.push(Line::System("x".into()));
+        app.streaming_assistant.push_str("partial");
+        app.streaming_reasoning.push_str("thought");
+        app.open_tools.insert("c1".into(), ("cmd".into(), "out".into()));
+        app.clear_transient();
+        assert!(app.lines.is_empty());
+        assert!(app.streaming_assistant.is_empty());
+        assert!(app.streaming_reasoning.is_empty());
+        assert!(app.open_tools.is_empty());
+        assert_eq!(app.scroll_from_bottom, 0);
     }
 }

@@ -577,6 +577,7 @@ name = "forge-tui"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "crossterm",
  "forge-core",
@@ -592,6 +593,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.0",
  "uuid",
 ]
 

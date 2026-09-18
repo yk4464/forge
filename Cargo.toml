@@ -35,6 +35,7 @@ chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
 ratatui = "0.29"
 crossterm = "0.28"
+unicode-width = "0.2"
 
 forge-core = { path = "crates/forge-core" }
 forge-provider = { path = "crates/forge-provider" }
