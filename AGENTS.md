@@ -20,7 +20,7 @@ forge：Rust 编写的流式优先终端编程 Agent（v0.0.1 原型）。单一
 
 ```bash
 cargo build --workspace          # 必须零警告
-cargo test --workspace           # 当前 55 个测试
+cargo test --workspace           # 当前 67 个测试
 cargo run -p forge-tui           # 跑 TUI
 target/debug/forge check "..."   # 无头验收（复用 check 会话）
 ```
@@ -46,11 +46,16 @@ target/debug/forge check "..."   # 无头验收（复用 check 会话）
   裁剪必须保持工具调用/结果成对。
 - 多轮记忆靠 `Agent` 跨轮持久 + 启动时回放 SQLite 历史（`build_agent`）；不要
   在每轮重建 Agent。
+- shell 实时转发靠 `execute` 任务上的 select 循环并发驱动（`emit` 非 `'static`
+  不能跨 spawn，管道块经通道回送本任务）；超时后排水仅 250ms（结果须贴近
+  截止时间落地），正常退出排水上限 1.5s（孙进程握住管道写端时兜底）——改
+  `shell.rs` 时保持这两个界限。
 
 ## 必读文档
 
-- `ROADMAP.md` — **S0–S7 分阶段计划 + S0 已知缺陷清单**（shell 实时转发未并发驱动、
-  大输出捕获内存无界等）。改 `shell.rs`/`compact.rs` 前先读 S0，别把已知缺口当新发现。
+- `ROADMAP.md` — **S0–S7 分阶段计划**。S0 基线问题已于 2026-09-19 全部修复
+  （S0 清单逐条标注了 commit）；改 `shell.rs`/`compact.rs` 前先读对应节与现有
+  回归测试，别把已修项当新发现。
 - `README.md` / `README_EN.md` — 功能边界按此表述，不要夸大未实现特性。
 
 ## 约定
