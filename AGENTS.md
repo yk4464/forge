@@ -20,7 +20,7 @@ forge：Rust 编写的流式优先终端编程 Agent（v0.0.1 原型）。单一
 
 ```bash
 cargo build --workspace          # 必须零警告
-cargo test --workspace           # 当前 27 个测试
+cargo test --workspace           # 当前 55 个测试
 cargo run -p forge-tui           # 跑 TUI
 target/debug/forge check "..."   # 无头验收（复用 check 会话）
 ```
@@ -41,8 +41,9 @@ target/debug/forge check "..."   # 无头验收（复用 check 会话）
 - **Provider SSE 测试必须** `#[tokio::test(flavor = "multi_thread")]` +
   `spawn_blocking` 里 accept TcpListener——单线程 runtime 在 Windows 上会挂死
   （现有 `crates/forge-provider/tests/*` 是模板）。
-- 压缩常量（`context.rs`/`compact.rs`，清洁室复刻 Codex）：有效窗口 = 原始窗口 × 0.95，
-  自动压缩阈值 = 有效窗口 × 0.90；裁剪必须保持工具调用/结果成对。
+- 压缩常量（`context.rs`/`compact.rs`，清洁室复刻 Codex）：有效窗口 =
+  min(原始窗口 × 0.95, 原始窗口 − max_output_tokens)，自动压缩阈值 = 有效窗口 × 0.90；
+  裁剪必须保持工具调用/结果成对。
 - 多轮记忆靠 `Agent` 跨轮持久 + 启动时回放 SQLite 历史（`build_agent`）；不要
   在每轮重建 Agent。
 
