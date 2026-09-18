@@ -1,5 +1,19 @@
 # 更新日志
 
+## Unreleased
+
+### S2：统一权限层与交互审批（S2 开工）
+
+- `PermissionPolicy` 从 bool 升级为 **allow / ask / deny** 决策，规则来源：
+  config `[permissions]`（按工具）→ 会话级批准（TUI "本会话总是允许"）→
+  兜底（shell 默认 ask，未知工具默认 deny）
+- 审批流：ask 的调用在 `ApprovalGate` 挂起（started 日志已写），TUI 弹出
+  y/n/a 对话框（运行一次 / 本会话允许 / 拒绝，Esc = 拒绝）；拒绝以成对
+  事件 + 错误结果记录进转录，模型能看到拒绝原因并调整
+- **无头模式遇到 ask 一律明确拒绝**（"无审批者可用"），绝不默认放行；
+  config 中显式 allow 的工具不受影响
+- Runtime 新增 `approve(call_id, approved)`；`Approver` 随 S2/S6 继续完善
+
 ## v0.2.0 — 2026-09-19
 
 **S1「可控运行与数据可靠性」阶段完成。** 版本策略：每完成一个 ROADMAP 阶段 minor +1。

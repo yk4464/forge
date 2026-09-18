@@ -23,7 +23,7 @@ forge：Rust 编写的流式优先终端编程 Agent（v0.2.0）。单一 shell 
 
 ```bash
 cargo build --workspace          # 必须零警告
-cargo test --workspace           # 当前 92 个测试
+cargo test --workspace           # 当前 101 个测试
 cargo run -p forge-tui           # 跑 TUI
 target/debug/forge check "..."   # 无头验收（复用 check 会话）
 ```
