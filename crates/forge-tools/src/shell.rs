@@ -8,6 +8,10 @@
 //!   are forwarded to the UI through `ToolCallbacks` while the child runs
 //!   (driven by a select loop on this task, where `emit` lives)
 //! - kill_on_drop(true): a dropped future kills the child
+//! - the child is assigned to a kill-on-close Job Object: timeouts,
+//!   cancellation, and normal completion terminate the whole process tree
+//!   (bash + grandchildren), not just the direct child — long-lived
+//!   background processes need the planned background-task manager
 //! - capture memory is bounded per stream (head+tail keep, middle marker);
 //!   the pipes are always drained to EOF so the child can never block
 //! - on timeout the child is killed but the already-captured output is
@@ -44,6 +48,79 @@ const DRAIN_GRACE: Duration = Duration::from_millis(1500);
 /// the shared buffers, so only a short drain for in-flight chunks is
 /// warranted. A grandchild may hold the pipe open much longer than this.
 const TIMEOUT_DRAIN: Duration = Duration::from_millis(250);
+
+#[cfg(windows)]
+mod job {
+    //! Kill-on-close Job Object: terminating (or closing) the job takes
+    //! down every process in the child's tree — the direct-child kill
+    //! cannot reach grandchildren that outlive bash or hold our pipes.
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// RAII job handle: dropping it kills every process still assigned.
+    pub struct JobHandle(HANDLE);
+
+    // The raw handle is only ever passed back to job APIs; the owner never
+    // dereferences it, so moving the wrapper across threads is sound.
+    unsafe impl Send for JobHandle {}
+
+    impl JobHandle {
+        /// `None` when job creation fails (restricted environment): the
+        /// caller falls back to direct-child kill semantics.
+        pub fn new() -> Option<Self> {
+            unsafe {
+                let job = CreateJobObjectW(ptr::null(), ptr::null());
+                if job.is_null() {
+                    return None;
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let ok = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if ok == 0 {
+                    CloseHandle(job);
+                    return None;
+                }
+                Some(Self(job))
+            }
+        }
+
+        pub fn assign(&self, process: std::os::windows::io::RawHandle) -> bool {
+            unsafe { AssignProcessToJobObject(self.0, process as HANDLE) != 0 }
+        }
+    }
+
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod job {
+    //! Non-Windows placeholder: no process-tree management yet.
+    pub struct JobHandle;
+
+    impl JobHandle {
+        pub fn new() -> Option<Self> {
+            None
+        }
+        pub fn assign(&self, _process: usize) -> bool {
+            false
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ShellArgs {
@@ -192,6 +269,14 @@ impl Tool for ShellTool {
             .spawn()
             .map_err(|e| Error::Tool(format!("spawn {bash:?} failed: {e}")))?;
 
+        // Put the child in a kill-on-close job: timeout, cancellation, and
+        // normal completion then end the whole process tree at once.
+        let job = job::JobHandle::new();
+        #[cfg(windows)]
+        if let (Some(j), Some(h)) = (&job, child.raw_handle()) {
+            j.assign(h);
+        }
+
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
@@ -241,8 +326,12 @@ impl Tool for ShellTool {
         }
 
         if timed_out {
+            // Dropping the job terminates every process in the tree, so
+            // the pipes' write ends close at once (grandchildren included)
+            // and the drain below hits EOF instead of its grace period.
             // The pinned wait future was dropped with the block above, so
-            // the child borrow is free here. kill_on_drop backs this up.
+            // the child borrow is free here; kill_on_drop backs this up.
+            drop(job);
             let _ = child.start_kill();
         }
 
@@ -675,6 +764,45 @@ mod tests {
             out.content.contains("early-marker"),
             "captured output lost on timeout: {}",
             out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_whole_process_tree() {
+        // Regression (S1 §12): bash `exec`s into sleep, so the direct
+        // child is no longer bash; a grandchild subshell keeps holding the
+        // stdout pipe for 30s. Only a Job Object ends the tree at once.
+        //
+        // Discriminator: a control run with NO pipe-holding grandchild
+        // always lands right after its timeout (EOF at once). The tree run
+        // must match it; without tree-kill it pays the 250ms drain grace
+        // plus the 250ms reap timeout on top. Both runs see the same
+        // machine load, so the *difference* is the robust signal.
+        let t = Arc::new(ShellTool::with_defaults());
+        let emit = Arc::new(NullEmit);
+
+        let run = |command: &str| {
+            let t = t.clone();
+            let emit = emit.clone();
+            let cmd = command.to_string();
+            let start = std::time::Instant::now();
+            tokio::spawn(async move {
+                let out = t
+                    .execute("c1", json!({"command": cmd, "timeout_ms": 500}), &*emit)
+                    .await
+                    .unwrap();
+                (out.timed_out, start.elapsed())
+            })
+        };
+
+        let control = run("exec sleep 30").await.unwrap();
+        let tree = run("( sleep 30; echo straggler ) & exec sleep 30")
+            .await
+            .unwrap();
+        assert!(control.0 && tree.0, "both runs must time out");
+        assert!(
+            tree.1 < control.1 + Duration::from_millis(250),
+            "tree kill must close pipes at once: control {control:?} vs tree {tree:?}"
         );
     }
 
