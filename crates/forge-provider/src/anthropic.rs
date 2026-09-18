@@ -22,7 +22,7 @@ use forge_core::error::{Error, Result};
 use forge_core::message::{Message, ToolCall, Usage};
 use forge_core::traits::{ModelProvider, ModelRequest, ProviderEvent};
 
-use super::openai::map_http_error;
+use super::openai::{map_http_error, CONNECT_TIMEOUT, READ_TIMEOUT};
 
 pub struct AnthropicProvider {
     http: reqwest::Client,
@@ -34,6 +34,8 @@ impl AnthropicProvider {
         Self {
             http: reqwest::Client::builder()
                 .user_agent("forge/0.1")
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
                 .build()
                 .expect("reqwest client"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -50,9 +52,13 @@ impl AnthropicProvider {
 }
 
 /// Canonical messages → Messages API `messages` (system pulled out).
+/// Consecutive tool results are merged into a single user message: the
+/// API requires every tool_result to sit in the user turn that follows
+/// the assistant tool_use turn, and parallel tool calls produce several
+/// results back to back.
 fn to_wire(msgs: &[Message]) -> (String, Vec<Value>) {
     let mut system = String::new();
-    let mut out = Vec::with_capacity(msgs.len());
+    let mut out: Vec<Value> = Vec::with_capacity(msgs.len());
     for m in msgs {
         match m {
             Message::System { content } => {
@@ -81,7 +87,9 @@ fn to_wire(msgs: &[Message]) -> (String, Vec<Value>) {
                     }));
                 }
                 if blocks.is_empty() {
-                    blocks.push(json!({"type": "text", "text": ""}));
+                    // Empty assistant turns are skipped entirely: the API
+                    // rejects empty text blocks.
+                    continue;
                 }
                 out.push(json!({"role": "assistant", "content": blocks}));
             }
@@ -91,13 +99,30 @@ fn to_wire(msgs: &[Message]) -> (String, Vec<Value>) {
                 } else {
                     content.clone()
                 };
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": text,
+                });
+                // Merge into the previous user message when it is the
+                // tool-result turn (consecutive ToolResult messages).
+                match out.last_mut() {
+                    Some(last) if last["role"] == "user" => {
+                        if let Some(arr) = last
+                            .get_mut("content")
+                            .and_then(Value::as_array_mut)
+                        {
+                            if arr.iter().all(|b| b["type"] == "tool_result") {
+                                arr.push(block);
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 out.push(json!({
                     "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": text,
-                    }],
+                    "content": [block],
                 }));
             }
         }
@@ -127,10 +152,23 @@ struct StreamState {
     usage_in: i64,
     usage_out: i64,
     error: Option<String>,
+    /// Set when the transport broke mid-stream; surfaced at finalize so a
+    /// truncated stream is never mistaken for a complete answer.
+    transport_error: Option<String>,
 }
 
 impl StreamState {
     fn finalize(self) -> Vec<ProviderEvent> {
+        // A broken transport must never be presented as a complete answer:
+        // surface the interruption and suppress possibly-truncated calls.
+        if let Some(err) = self.transport_error {
+            return vec![
+                ProviderEvent::ProviderError {
+                    message: format!("stream interrupted: {err}"),
+                },
+                ProviderEvent::Done,
+            ];
+        }
         let mut out = Vec::new();
         let mut calls: Vec<ToolCall> = self
             .calls
@@ -192,10 +230,12 @@ fn handle_frame(data: &str, st: &mut StreamState) -> Vec<ProviderEvent> {
 
     match v.get("type").and_then(Value::as_str).unwrap_or("") {
         "message_start" => {
-            st.usage_in = v
-                .pointer("/message/usage/input_tokens")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
+            // input_tokens excludes cache traffic; add cache read/creation
+            // so accounting sees the full prompt size.
+            let base = v.pointer("/message/usage/input_tokens").and_then(Value::as_i64).unwrap_or(0);
+            let cache_read = v.pointer("/message/usage/cache_read_input_tokens").and_then(Value::as_i64).unwrap_or(0);
+            let cache_create = v.pointer("/message/usage/cache_creation_input_tokens").and_then(Value::as_i64).unwrap_or(0);
+            st.usage_in = base + cache_read + cache_create;
             vec![]
         }
         "content_block_start" => {
@@ -309,7 +349,8 @@ impl ModelProvider for AnthropicProvider {
             match ev {
                 Ok(ev) => handle_frame(&ev.data, st),
                 Err(e) => {
-                    tracing::warn!("messages SSE decode error: {e}");
+                    tracing::warn!("messages SSE transport error: {e}");
+                    st.transport_error = Some(e.to_string());
                     Vec::new()
                 }
             }
@@ -325,5 +366,81 @@ impl ModelProvider for AnthropicProvider {
             .boxed();
 
         Ok(post)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "shell".into(),
+            arguments: json!({"command": "ls"}),
+        }
+    }
+
+    #[test]
+    fn consecutive_tool_results_merge_into_one_user_message() {
+        // Parallel tool calls produce back-to-back ToolResult messages;
+        // the Messages API requires them in a single user turn.
+        let msgs = vec![
+            Message::user("run two things"),
+            Message::Assistant {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![tool_call("a"), tool_call("b")],
+            },
+            Message::ToolResult {
+                tool_call_id: "a".into(),
+                content: "out-a".into(),
+                is_error: false,
+            },
+            Message::ToolResult {
+                tool_call_id: "b".into(),
+                content: "out-b".into(),
+                is_error: true,
+            },
+        ];
+        let (_, wire) = to_wire(&msgs);
+        assert_eq!(wire.len(), 3, "user + assistant + ONE merged user turn: {wire:?}");
+        let user = &wire[2];
+        assert_eq!(user["role"], "user");
+        let blocks = user["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[1]["tool_use_id"], "b");
+        assert!(blocks[1]["content"].as_str().unwrap().starts_with("[error]"));
+    }
+
+    #[test]
+    fn empty_assistant_is_skipped_not_empty_text() {
+        let msgs = vec![
+            Message::user("hi"),
+            Message::Assistant {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![],
+            },
+        ];
+        let (_, wire) = to_wire(&msgs);
+        assert_eq!(wire.len(), 1, "empty assistant must not be sent: {wire:?}");
+    }
+
+    #[test]
+    fn plain_user_message_is_not_merged_with_tool_results() {
+        let msgs = vec![
+            Message::ToolResult {
+                tool_call_id: "a".into(),
+                content: "out".into(),
+                is_error: false,
+            },
+            Message::user("next question"),
+        ];
+        let (_, wire) = to_wire(&msgs);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[1]["content"][0]["type"], "text");
     }
 }

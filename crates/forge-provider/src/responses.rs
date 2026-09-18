@@ -25,7 +25,7 @@ use forge_core::error::{Error, Result};
 use forge_core::message::{Message, ToolCall, Usage};
 use forge_core::traits::{ModelProvider, ModelRequest, ProviderEvent};
 
-use super::openai::map_http_error;
+use super::openai::{map_http_error, CONNECT_TIMEOUT, READ_TIMEOUT};
 
 pub struct ResponsesProvider {
     http: reqwest::Client,
@@ -37,6 +37,8 @@ impl ResponsesProvider {
         Self {
             http: reqwest::Client::builder()
                 .user_agent("forge/0.1")
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
                 .build()
                 .expect("reqwest client"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -129,10 +131,23 @@ struct StreamState {
     /// True once any content event arrived (used to downgrade trailing
     /// gateway error frames).
     got_content: bool,
+    /// Set when the transport broke mid-stream. Unlike in-band error
+    /// frames this is always surfaced: a dead connection can never be a
+    /// complete response.
+    transport_error: Option<String>,
 }
 
 impl StreamState {
     fn finalize(self) -> Vec<ProviderEvent> {
+        // A broken transport must never be presented as a complete answer.
+        if let Some(err) = self.transport_error {
+            return vec![
+                ProviderEvent::ProviderError {
+                    message: format!("stream interrupted: {err}"),
+                },
+                ProviderEvent::Done,
+            ];
+        }
         let mut out = Vec::new();
         // args are keyed by the same output_index as calls.
         let mut calls: Vec<ToolCall> = self
@@ -185,6 +200,23 @@ fn handle_frame(event_name: &str, data: &str, st: &mut StreamState) -> Vec<Provi
         .and_then(Value::as_str)
         .unwrap_or(event_name)
         .to_string();
+
+    // Gateways (and some proxies) emit bare `data: {"error":{...}}` frames
+    // with no `type` field and no `event:` line. Without this check they
+    // fall through to `_ => vec![]` and a failed response looks like an
+    // empty success. Typed error frames still take the "error" arm below.
+    if v.get("type").is_none() {
+        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+            st.error = Some(
+                err.get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| err.as_str())
+                    .unwrap_or("responses stream error")
+                    .to_string(),
+            );
+            return vec![];
+        }
+    }
 
     match ty.as_str() {
         "response.output_text.delta" => {
@@ -239,11 +271,19 @@ fn handle_frame(event_name: &str, data: &str, st: &mut StreamState) -> Vec<Provi
         }
         "response.completed" => {
             if let Some(u) = v.pointer("/response/usage") {
-                st.usage = Some(Usage {
-                    input_tokens: u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
-                    output_tokens: u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
-                    total_tokens: u.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
-                });
+                let input = u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+                let output = u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+                // Missing total_tokens: derive from the parts. An all-zero
+                // usage is skipped so accounting is never re-anchored to 0.
+                let total = u.get("total_tokens").and_then(Value::as_i64).unwrap_or(0);
+                let total = if total > 0 { total } else { input + output };
+                if total > 0 || input > 0 || output > 0 {
+                    st.usage = Some(Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        total_tokens: total,
+                    });
+                }
             }
             if let Some(e) = v.pointer("/response/error").filter(|e| !e.is_null()) {
                 st.error = Some(
@@ -328,7 +368,8 @@ impl ModelProvider for ResponsesProvider {
             match ev {
                 Ok(ev) => handle_frame(ev.event.as_str(), &ev.data, st),
                 Err(e) => {
-                    tracing::warn!("responses SSE decode error: {e}");
+                    tracing::warn!("responses SSE transport error: {e}");
+                    st.transport_error = Some(e.to_string());
                     Vec::new()
                 }
             }

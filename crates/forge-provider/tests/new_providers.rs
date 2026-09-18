@@ -182,3 +182,59 @@ async fn anthropic_error_frame_surfaces() {
     }
     assert_eq!(err.as_deref(), Some("Overloaded"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_bare_error_frame_without_content_surfaces() {
+    // Gateway 200 + a bare `data: {"error":...}` frame with no `type` and
+    // no `event:` line. Before the fix this was silently dropped and the
+    // turn ended as a successful empty answer.
+    let body: &'static str = Box::leak(
+        "data: {\"error\":{\"message\":\"upstream returned empty content\",\"type\":\"server_error\"}}\n\n\
+         data: [DONE]\n\n"
+            .to_string()
+            .into_boxed_str(),
+    );
+    let url = serve_once(body, "HTTP/1.1 200 OK").await;
+    let p = ResponsesProvider::new(url);
+    let stream = p.stream(req(), "sk").await.expect("stream ok");
+    let mut stream = Box::pin(stream);
+    let mut err = None;
+    while let Some(ev) = stream.next().await {
+        if let ProviderEvent::ProviderError { message } = ev {
+            err = Some(message);
+        }
+    }
+    assert_eq!(
+        err.as_deref(),
+        Some("upstream returned empty content"),
+        "bare error frame with no content must surface"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anthropic_usage_counts_cache_tokens() {
+    // input_tokens excludes cache traffic; accounting must add cache
+    // read/creation tokens or the compaction threshold fires too late.
+    let body: &'static str = Box::leak(
+        "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":500,\"cache_creation_input_tokens\":40}}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n\
+         data: [DONE]\n\n"
+            .to_string()
+            .into_boxed_str(),
+    );
+    let url = serve_once(body, "HTTP/1.1 200 OK").await;
+    let p = AnthropicProvider::new(url);
+    let stream = p.stream(req(), "sk").await.expect("stream ok");
+    let mut stream = Box::pin(stream);
+    let mut usage = None;
+    while let Some(ev) = stream.next().await {
+        if let ProviderEvent::Usage { usage: u } = ev {
+            usage = Some(u);
+        }
+    }
+    let u = usage.expect("usage event");
+    assert_eq!(u.input_tokens, 640, "input + cache read + cache creation");
+    assert_eq!(u.total_tokens, 649);
+}

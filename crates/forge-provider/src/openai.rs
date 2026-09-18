@@ -20,6 +20,12 @@ use forge_core::error::{Error, Result};
 use forge_core::message::{Message, ToolCall, Usage};
 use forge_core::traits::{ModelProvider, ModelRequest, ProviderEvent};
 
+/// Connect/read timeouts shared by all providers. `read_timeout` bounds
+/// the wait for each body chunk (covers stalled SSE streams) without
+/// capping total stream duration, which is unbounded for long generations.
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub struct OpenAiProvider {
     http: reqwest::Client,
     base_url: String,
@@ -31,6 +37,8 @@ impl OpenAiProvider {
         Self {
             http: reqwest::Client::builder()
                 .user_agent("forge/0.1")
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
                 .build()
                 .expect("reqwest client"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -142,6 +150,8 @@ pub(crate) fn map_http_error(status: u16, body: &str) -> Error {
         || lower.contains("maximum context")
         || lower.contains("too many tokens")
         || lower.contains("reduce the length")
+        // Anthropic: "prompt is too long: N tokens > M maximum context"
+        || lower.contains("prompt is too long")
         || (lower.contains("context") && lower.contains("window"));
     if overflow {
         return Error::ContextWindowExceeded { used: 0, limit: 0 };
@@ -169,13 +179,18 @@ fn extract_error_message(body: &str) -> String {
     truncate_body(body)
 }
 
+/// Truncate an error body for display without ever slicing through a
+/// multi-byte UTF-8 character (a raw byte index would panic on CJK text).
 fn truncate_body(body: &str) -> String {
     const MAX: usize = 400;
     if body.len() <= MAX {
-        body.to_string()
-    } else {
-        format!("{}…", &body[..MAX])
+        return body.to_string();
     }
+    let mut end = MAX;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &body[..end])
 }
 
 /// Parse one SSE `data:` payload into zero or more events.
@@ -191,7 +206,7 @@ fn parse_chunk(data: &str, acc: &mut Vec<ProviderEvent>) {
             return;
         }
     };
-    if let Some(err) = v.get("error") {
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         let msg = if let Some(s) = err.as_str() {
             s.to_string()
         } else {
@@ -204,12 +219,18 @@ fn parse_chunk(data: &str, acc: &mut Vec<ProviderEvent>) {
         return;
     }
     if let Some(usage) = v.get("usage").filter(|u| u.is_object() && !u.as_object().unwrap().is_empty()) {
-        let usage = Usage {
-            input_tokens: usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
-            output_tokens: usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
-            total_tokens: usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
-        };
-        acc.push(ProviderEvent::Usage { usage });
+        let total = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0);
+        // A total of 0 means the gateway dropped the usage fields; skip it
+        // so accounting is never re-anchored to 0.
+        if total > 0 {
+            acc.push(ProviderEvent::Usage {
+                usage: Usage {
+                    input_tokens: usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
+                    output_tokens: usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
+                    total_tokens: total,
+                },
+            });
+        }
     }
     if let Some(choices) = v.get("choices").and_then(Value::as_array) {
         for choice in choices {
@@ -257,6 +278,33 @@ fn parse_chunk(data: &str, acc: &mut Vec<ProviderEvent>) {
             }
         }
     }
+}
+
+/// Apply one tool-call fragment to the reassembly state. Returns false
+/// (and mutates nothing) when the fragment index is bogus and dropped.
+fn apply_fragment(st: &mut FragmentState, index: usize, id: &str, name: &str, args: &str) -> bool {
+    if index > MAX_TOOL_CALL_INDEX {
+        tracing::warn!(
+            "chat/completions: dropping tool-call fragment with bogus index {index}"
+        );
+        return false;
+    }
+    while st.fragments.len() <= index {
+        st.fragments.push(ToolCall {
+            id: String::new(),
+            name: String::new(),
+            arguments: Value::String(String::new()),
+        });
+        st.args.push(String::new());
+    }
+    if !id.is_empty() {
+        st.fragments[index].id = id.to_string();
+    }
+    if !name.is_empty() {
+        st.fragments[index].name = name.to_string();
+    }
+    st.args[index].push_str(args);
+    true
 }
 
 #[async_trait]
@@ -324,21 +372,7 @@ impl ModelProvider for OpenAiProvider {
                                 args,
                             } => {
                                 let mut st = state.lock().unwrap();
-                                while st.fragments.len() <= index {
-                                    st.fragments.push(ToolCall {
-                                        id: String::new(),
-                                        name: String::new(),
-                                        arguments: Value::String(String::new()),
-                                    });
-                                    st.args.push(String::new());
-                                }
-                                if !id.is_empty() {
-                                    st.fragments[index].id = id;
-                                }
-                                if !name.is_empty() {
-                                    st.fragments[index].name = name;
-                                }
-                                st.args[index].push_str(&args);
+                                apply_fragment(&mut st, index, &id, &name, &args);
                             }
                             other => out.push(other),
                         }
@@ -347,6 +381,7 @@ impl ModelProvider for OpenAiProvider {
                 }
                 Err(e) => {
                     tracing::warn!("SSE decode error: {e}");
+                    state.lock().unwrap().transport_error = Some(e.to_string());
                     Vec::new()
                 }
             }
@@ -358,7 +393,7 @@ impl ModelProvider for OpenAiProvider {
             .chain(futures::stream::once(async move {
                 let mut out = Vec::new();
                 let mut calls = Vec::new();
-                let state = end_state.lock().unwrap();
+                let mut state = end_state.lock().unwrap();
                 for (i, mut c) in state.fragments.iter().cloned().enumerate() {
                     let args_str = state.args[i].clone();
                     let arguments = if args_str.trim().is_empty() {
@@ -371,8 +406,16 @@ impl ModelProvider for OpenAiProvider {
                     c.arguments = arguments;
                     calls.push(c);
                 }
+                // Placeholder slots from sparse indexes (or empty-id calls)
+                // would produce requests the vendor rejects; drop them.
+                calls.retain(|c| !c.id.is_empty() && !c.name.is_empty());
                 if !calls.is_empty() {
                     out.push(ProviderEvent::ToolCalls { calls });
+                }
+                if let Some(err) = state.transport_error.take() {
+                    out.push(ProviderEvent::ProviderError {
+                        message: format!("stream interrupted: {err}"),
+                    });
                 }
                 out.push(ProviderEvent::Done);
                 out
@@ -389,10 +432,81 @@ impl ModelProvider for OpenAiProvider {
 struct FragmentState {
     fragments: Vec<ToolCall>,
     args: Vec<String>,
+    /// Set when the transport broke mid-stream (decode error, connection
+    /// reset). Finalize surfaces it so truncated output is never reported
+    /// as a complete answer.
+    transport_error: Option<String>,
 }
+
+/// Sanity cap on tool-call fragment indexes. The index comes from the
+/// server (untrusted); a bogus huge value would otherwise grow the
+/// fragment vec without bound.
+const MAX_TOOL_CALL_INDEX: usize = 1024;
 
 // Keep io import used if lints complain in future edits.
 #[allow(dead_code)]
 fn _io_marker() -> Option<io::Error> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_body_never_splits_utf8() {
+        // 100 CJK chars = 300 bytes; add more so len > 400 and the 400th
+        // byte lands mid-character. The old `&body[..400]` panicked here.
+        let body = "汉".repeat(200);
+        let out = truncate_body(&body);
+        assert!(out.chars().count() < 200);
+        assert!(out.ends_with('…'));
+        // Sanity: identical behavior for ASCII (400 bytes + the 3-byte ellipsis).
+        assert_eq!(truncate_body(&"a".repeat(500)).len(), 403);
+    }
+
+    #[test]
+    fn error_null_frame_is_ignored() {
+        let mut acc = Vec::new();
+        parse_chunk(r#"{"error":null,"choices":[]}"#, &mut acc);
+        assert!(
+            !acc.iter().any(|e| matches!(e, ProviderEvent::ProviderError { .. })),
+            "error:null must not abort the turn, got {acc:?}"
+        );
+    }
+
+    #[test]
+    fn usage_without_total_is_dropped() {
+        let mut acc = Vec::new();
+        parse_chunk(r#"{"usage":{"prompt_tokens":10}}"#, &mut acc);
+        assert!(
+            !acc.iter().any(|e| matches!(e, ProviderEvent::Usage { .. })),
+            "usage missing total_tokens must not zero the accounting, got {acc:?}"
+        );
+    }
+
+    #[test]
+    fn tool_call_fragment_index_is_bounded() {
+        // The index comes from the server; a bogus huge value must not
+        // allocate an unbounded fragment vec.
+        let mut st = FragmentState::default();
+        assert!(!apply_fragment(&mut st, 100_000_000, "c1", "shell", "{}"));
+        assert!(st.fragments.is_empty());
+        // A sane index still assembles.
+        assert!(apply_fragment(&mut st, 0, "c1", "shell", r#"{"co"#));
+        assert!(apply_fragment(&mut st, 0, "", "", r#"mmand":"ls"}"#));
+        assert_eq!(st.fragments[0].name, "shell");
+    }
+
+    #[test]
+    fn finalize_drops_placeholder_calls() {
+        // A fragment stream starting at index 1 leaves a placeholder at 0;
+        // finalize must not surface the empty call.
+        let mut st = FragmentState::default();
+        assert!(apply_fragment(&mut st, 1, "c1", "shell", "{}"));
+        let mut calls: Vec<ToolCall> = st.fragments.iter().cloned().collect();
+        calls.retain(|c| !c.id.is_empty() && !c.name.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+    }
 }

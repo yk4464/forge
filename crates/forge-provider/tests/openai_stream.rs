@@ -151,3 +151,59 @@ async fn http_overflow_maps_to_context_error() {
     };
     assert!(err.is_context_window_exceeded(), "got: {err:?}");
 }
+
+/// Serve a partial SSE response: declares a longer body than it sends and
+/// closes the socket mid-stream, so the client hits a transport error.
+async fn serve_truncated(partial: &'static str, declared_len: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::task::spawn_blocking(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        let mut buf = [0u8; 8192];
+        let _ = sock.read(&mut buf);
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            declared_len,
+            partial
+        );
+        let _ = sock.write_all(resp.as_bytes());
+        let _ = sock.flush();
+        let _ = sock.shutdown(std::net::Shutdown::Both);
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    format!("http://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transport_interruption_surfaces_as_provider_error() {
+    // One complete frame, then the connection dies before [DONE]. The old
+    // behavior swallowed the error and emitted Done — a truncated answer
+    // presented as complete.
+    let partial: &'static str = Box::leak(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial ans\"}}]}\n\n".to_string().into_boxed_str(),
+    );
+    let url = serve_truncated(partial, partial.len() + 4096).await;
+    let p = OpenAiProvider::new(url);
+    let req = ModelRequest {
+        messages: vec![Message::user("hi")],
+        tools: vec![],
+        model: "m".into(),
+        temperature: None,
+        max_tokens: 64,
+        stream_reasoning: false,
+    };
+    let stream = p.stream(req, "sk").await.expect("stream ok");
+    let mut stream = Box::pin(stream);
+    let mut err = None;
+    let mut saw_done = false;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            ProviderEvent::ProviderError { message } => err = Some(message),
+            ProviderEvent::Done => saw_done = true,
+            _ => {}
+        }
+    }
+    assert!(saw_done, "stream must still terminate");
+    let msg = err.expect("transport break must surface as ProviderError");
+    assert!(msg.contains("stream interrupted"), "got: {msg}");
+}
