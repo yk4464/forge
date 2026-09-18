@@ -238,9 +238,9 @@ async fn run_tui() -> anyhow::Result<()> {
     // The live agent is kept across turns so context/history persist
     // within a session; rebuilt on /new and /resume.
     let mut agent: Option<Arc<Agent>> = None;
-    // Cancel handle for the turn in flight; Esc signals it, and it is
-    // dropped once the turn reaches its terminal state.
-    let mut turn_cancel: Option<forge_core::cancel::CancelHandle> = None;
+    // The runtime owns the agent for turns: serialized submits, Esc
+    // cancellation, per-turn event streams (S1 §14 运行接口).
+    let mut runtime: Option<Arc<forge_core::runtime::Runtime>> = None;
 
     loop {
         // Redraw.
@@ -253,20 +253,18 @@ async fn run_tui() -> anyhow::Result<()> {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     let submit = ui::on_key(&mut app, key);
                     if app.take_cancel_request() && app.busy {
-                        if let Some(h) = &turn_cancel {
-                            h.cancel();
+                        if let Some(rt) = &runtime {
+                            rt.cancel().await;
                             app.status = "cancelling…".into();
                         }
                     }
                     if submit {
                         let action = app.on_submit();
-                        // /exit must work even mid-turn: the agent task
-                        // outlives the UI loop and the process exits.
+                        // /exit must work even mid-turn: cancel the running
+                        // turn so the process tree is not left behind.
                         if matches!(action, CommandAction::Exit) {
-                            // Stop the in-flight turn before leaving so the
-                            // child process tree is not left running.
-                            if let Some(h) = &turn_cancel {
-                                h.cancel();
+                            if let Some(rt) = &runtime {
+                                rt.cancel().await;
                             }
                             app.should_quit = true;
                         } else if !app.busy {
@@ -282,31 +280,19 @@ async fn run_tui() -> anyhow::Result<()> {
                                         if let Some(w) = warning {
                                             app.push_line(app::Line::Error(w));
                                         }
-                                        agent = Some(a);
+                                        agent = Some(a.clone());
+                                        runtime = Some(forge_core::runtime::Runtime::new(a));
                                     }
-                                    if let Some(a) = &agent {
-                                        let (tx, rx) = mpsc::unbounded_channel();
-                                        let a = a.clone();
-                                        let text = text.clone();
-                                        let tx_guard = tx.clone();
-                                        app.busy = true;
-                                        let ch = forge_core::cancel::CancelHandle::default();
-                                        let token = ch.token();
-                                        turn_cancel = Some(ch);
-                                        tokio::spawn(async move {
-                                            let inner = tokio::spawn(async move {
-                                                a.run_turn(&text, tx, &token).await
-                                            });
-                                            // run_turn guarantees terminal
-                                            // events; this only catches a
-                                            // panicked agent task.
-                                            if let Err(join) = inner.await {
-                                                let _ = tx_guard.send(AgentEvent::Error {
-                                                    message: format!("agent task crashed: {join}"),
-                                                });
+                                    if let Some(rt) = &runtime {
+                                        match rt.submit(text).await {
+                                            Ok(handle) => {
+                                                app.busy = true;
+                                                events_rx = handle.into_events();
                                             }
-                                        });
-                                        events_rx = rx;
+                                            Err(e) => {
+                                                app.push_line(app::Line::Error(e.to_string()));
+                                            }
+                                        }
                                     }
                                 }
                                 CommandAction::NewSession => {
@@ -315,6 +301,7 @@ async fn run_tui() -> anyhow::Result<()> {
                                     app.session_title = "(new session)".into();
                                     app.status = "ready".into();
                                     agent = None; // fresh context next turn
+                                    runtime = None;
                                     ensure_session(&mut app, &*store).await;
                                 }
                                 CommandAction::Resume => {
@@ -339,7 +326,8 @@ async fn run_tui() -> anyhow::Result<()> {
                                             if let Some(w) = warning {
                                                 app.push_line(app::Line::Error(w));
                                             }
-                                            agent = Some(a);
+                                            agent = Some(a.clone());
+                                            runtime = Some(forge_core::runtime::Runtime::new(a));
                                         }
                                         Err(e) => {
                                             app.push_line(app::Line::Error(format!(
@@ -358,13 +346,13 @@ async fn run_tui() -> anyhow::Result<()> {
                                         if let Some(w) = warning {
                                             app.push_line(app::Line::Error(w));
                                         }
-                                        agent = Some(a);
+                                        agent = Some(a.clone());
+                                        runtime = Some(forge_core::runtime::Runtime::new(a.clone()));
                                     }
-                                    if let Some(a) = &agent {
+                                    if let Some(rt) = &runtime {
                                         let (tx, rx) = mpsc::unbounded_channel();
-                                        let a = a.clone();
                                         events_rx = rx;
-                                        let res = a.compact_manual(&tx).await;
+                                        let res = rt.agent().compact_manual(&tx).await;
                                         match res {
                                             Ok((b, aft)) => {
                                                 app.push_line(app::Line::System(format!(
@@ -389,10 +377,6 @@ async fn run_tui() -> anyhow::Result<()> {
         // Drain agent events.
         while let Ok(ev) = events_rx.try_recv() {
             app.on_agent_event(ev);
-        }
-        if !app.busy {
-            // Terminal state reached: the handle has served its purpose.
-            turn_cancel = None;
         }
 
         if app.should_quit {

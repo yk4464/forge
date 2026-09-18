@@ -28,6 +28,9 @@ pub enum Error {
     #[error("turn stopped: {0}")]
     BudgetExceeded(String),
 
+    #[error("a turn is already running; cancel it or wait for it to finish")]
+    Busy,
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

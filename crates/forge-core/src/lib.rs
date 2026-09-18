@@ -10,6 +10,7 @@ pub mod history;
 pub mod message;
 pub mod recovery;
 pub mod registry;
+pub mod runtime;
 pub mod session;
 pub mod traits;
 
