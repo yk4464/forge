@@ -107,21 +107,32 @@ pub trait SessionStore: Send + Sync {
     async fn get_meta(&self, session_id: Uuid, key: &str) -> Result<Option<Value>>;
 }
 
-/// No-op PermissionPolicy: M1 allows everything (decision recorded in the
-/// plan). The trait exists so approval UIs can slot in without touching the
-/// agent loop.
-#[async_trait]
-pub trait PermissionPolicy: Send + Sync {
-    /// Return true to allow execution.
-    async fn approve(&self, tool_name: &str, arguments: &Value) -> bool;
+/// Decision for one tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    /// Run it.
+    Allow,
+    /// Defer to the user (or refuse when no approver is available — headless
+    /// mode must never default to allow).
+    Ask,
+    /// Refuse it.
+    Deny,
 }
 
-/// Always-allow policy (M1 default).
+/// No-op PermissionPolicy: M1 allowed everything; it survives for tests
+/// and as the explicit "trust everything" choice.
+#[async_trait]
+pub trait PermissionPolicy: Send + Sync {
+    /// Evaluate a tool call.
+    async fn approve(&self, tool_name: &str, arguments: &Value) -> PermissionDecision;
+}
+
+/// Always-allow policy (prototype default; S2 adds rule-based policies).
 pub struct AllowAll;
 
 #[async_trait]
 impl PermissionPolicy for AllowAll {
-    async fn approve(&self, _tool_name: &str, _arguments: &Value) -> bool {
-        true
+    async fn approve(&self, _tool_name: &str, _arguments: &Value) -> PermissionDecision {
+        PermissionDecision::Allow
     }
 }

@@ -46,6 +46,8 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(agent: Arc<Agent>) -> Arc<Self> {
+        // A runtime always carries a frontend that can answer approvals.
+        agent.approvals_enabled.store(true, Ordering::SeqCst);
         Arc::new(Self {
             agent,
             busy: AtomicBool::new(false),
@@ -112,6 +114,12 @@ impl Runtime {
         if let Some(handle) = self.cancel.lock().await.take() {
             handle.cancel();
         }
+    }
+
+    /// Answer a pending approval request (S2). Returns false when no such
+    /// request is pending.
+    pub async fn approve(&self, call_id: &str, approved: bool) -> bool {
+        self.agent.approval_gate.respond(call_id, approved).await
     }
 }
 
@@ -229,6 +237,8 @@ mod tests {
             persisted_len: std::sync::atomic::AtomicUsize::new(0),
             history_replaced: std::sync::atomic::AtomicBool::new(false),
             persist_failed: std::sync::atomic::AtomicBool::new(false),
+            approval_gate: Arc::new(crate::approval::ApprovalGate::new()),
+            approvals_enabled: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

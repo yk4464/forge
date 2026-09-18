@@ -50,6 +50,8 @@ pub struct App {
     /// Esc was pressed; the main loop consumes this and signals the
     /// in-flight turn's cancel handle.
     pub cancel_requested: bool,
+    /// A tool call awaits user approval: (call_id, tool, command).
+    pub pending_approval: Option<(String, String, String)>,
 }
 
 impl App {
@@ -67,6 +69,7 @@ impl App {
             status: String::from("ready"),
             should_quit: false,
             cancel_requested: false,
+            pending_approval: None,
         }
     }
 
@@ -74,6 +77,11 @@ impl App {
     /// which forwards it to the turn's cancel handle.
     pub fn take_cancel_request(&mut self) -> bool {
         std::mem::replace(&mut self.cancel_requested, false)
+    }
+
+    /// Answer the pending approval; None when none is pending.
+    pub fn take_pending_approval(&mut self) -> Option<(String, String, String)> {
+        self.pending_approval.take()
     }
 
     /// Drop transcript + in-flight rendering state (used by /new).
@@ -105,10 +113,22 @@ impl App {
             AgentEvent::ReasoningDelta { delta } => {
                 self.streaming_reasoning.push_str(&delta);
             }
+            AgentEvent::ApprovalRequested { call_id, tool, command } => {
+                self.pending_approval = Some((call_id, tool.clone(), command.clone()));
+                self.status = format!("approve {tool}? y/n/a");
+                self.push_line(Line::System(format!(
+                    "approval needed: {tool} {command} — [y] run once · [a] allow this session · [n] deny"
+                )));
+            }
             AgentEvent::ToolCallStarted { call_id, name: _, command } => {
                 // Flush any streamed assistant text before the tool card.
                 self.flush_streaming();
                 self.open_tools.insert(call_id, (command, String::new()));
+                // An answered approval is reflected by the Started event.
+                if self.pending_approval.is_some() {
+                    self.pending_approval = None;
+                    self.status = "running…".into();
+                }
             }
             AgentEvent::ToolCallOutputDelta { call_id, chunk } => {
                 if let Some((_, out)) = self.open_tools.get_mut(&call_id) {

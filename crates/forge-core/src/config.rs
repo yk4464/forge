@@ -11,6 +11,21 @@ pub struct Config {
     pub context: ContextConfig,
     #[serde(default)]
     pub budget: BudgetConfig,
+    #[serde(default)]
+    pub permissions: PermissionConfig,
+}
+
+/// Permission rules per tool (S2). Decisions: "allow" | "ask" | "deny".
+/// Unlisted tools: `shell` asks, everything else is denied; `default`
+/// overrides that fallback when set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermissionConfig {
+    /// Fallback for tools without an explicit rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Explicit rules keyed by tool name.
+    #[serde(default)]
+    pub tools: std::collections::HashMap<String, String>,
 }
 
 /// Per-turn budget limits and runaway detection. A value of 0 disables

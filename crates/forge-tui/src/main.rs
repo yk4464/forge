@@ -8,7 +8,7 @@ use forge_core::config::Config;
 use forge_core::context::ContextManager;
 use forge_core::event::AgentEvent;
 use forge_core::registry::Registry;
-use forge_core::session::{AllowAll, SessionStore};
+use forge_core::session::SessionStore;
 use forge_core::message::Message;
 use forge_storage::SqliteSessionStore;
 use forge_tools::ShellTool;
@@ -129,7 +129,9 @@ async fn run_check(prompt: String) -> anyhow::Result<()> {
             id
         }
     };
-    let (agent, warning) = build_agent(&cfg, &api_key, &tools, &(store.clone() as Arc<dyn SessionStore>), &provider, Some(sid)).await;
+    let rule_policy: Arc<forge_core::permissions::RulePolicy> =
+        Arc::new(forge_core::permissions::RulePolicy::from_config(&cfg.permissions));
+    let (agent, warning) = build_agent(&cfg, &api_key, &tools, &(store.clone() as Arc<dyn SessionStore>), &provider, &rule_policy, Some(sid)).await;
     if let Some(w) = warning {
         // Never run a headless acceptance run against a transcript we
         // could not read.
@@ -238,6 +240,10 @@ async fn run_tui() -> anyhow::Result<()> {
     // The live agent is kept across turns so context/history persist
     // within a session; rebuilt on /new and /resume.
     let mut agent: Option<Arc<Agent>> = None;
+    // Rule-based permissions (S2): config rules + session approvals; the
+    // typed handle stays here so the TUI can record "always this session".
+    let rule_policy: Arc<forge_core::permissions::RulePolicy> =
+        Arc::new(forge_core::permissions::RulePolicy::from_config(&cfg.permissions));
     // The runtime owns the agent for turns: serialized submits, Esc
     // cancellation, per-turn event streams (S1 §14 运行接口).
     let mut runtime: Option<Arc<forge_core::runtime::Runtime>> = None;
@@ -251,7 +257,28 @@ async fn run_tui() -> anyhow::Result<()> {
         if ev_available {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if key.kind == crossterm::event::KeyEventKind::Press {
-                    let submit = ui::on_key(&mut app, key);
+                    // Approval dialog intercepts keys while a request is open.
+                    let mut approval_handled = false;
+                    if app.pending_approval.is_some() {
+                        match key.code {
+                            crossterm::event::KeyCode::Char('y' | 'Y') => {
+                                answer_approval(&mut app, &runtime, &rule_policy, false, true).await;
+                                approval_handled = true;
+                            }
+                            crossterm::event::KeyCode::Char('a' | 'A') => {
+                                answer_approval(&mut app, &runtime, &rule_policy, true, true).await;
+                                approval_handled = true;
+                            }
+                            crossterm::event::KeyCode::Char('n' | 'N')
+                            | crossterm::event::KeyCode::Esc => {
+                                answer_approval(&mut app, &runtime, &rule_policy, false, false).await;
+                                approval_handled = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !approval_handled {
+                        let submit = ui::on_key(&mut app, key);
                     if app.take_cancel_request() && app.busy {
                         if let Some(rt) = &runtime {
                             rt.cancel().await;
@@ -273,7 +300,7 @@ async fn run_tui() -> anyhow::Result<()> {
                                     ensure_session(&mut app, &*store).await;
                                     if agent.is_none() {
                                         let (a, warning) = build_agent(
-                                            &cfg, &api_key, &tools, &store_dyn, &provider,
+                                            &cfg, &api_key, &tools, &store_dyn, &provider, &rule_policy,
                                             app.session_id,
                                         )
                                         .await;
@@ -319,7 +346,7 @@ async fn run_tui() -> anyhow::Result<()> {
                                             // Rebuild the agent with this session's
                                             // history so conversation continuity works.
                                             let (a, warning) = build_agent(
-                                                &cfg, &api_key, &tools, &store_dyn, &provider,
+                                                &cfg, &api_key, &tools, &store_dyn, &provider, &rule_policy,
                                                 app.session_id,
                                             )
                                             .await;
@@ -339,7 +366,7 @@ async fn run_tui() -> anyhow::Result<()> {
                                 CommandAction::Compact => {
                                     if agent.is_none() {
                                         let (a, warning) = build_agent(
-                                            &cfg, &api_key, &tools, &store_dyn, &provider,
+                                            &cfg, &api_key, &tools, &store_dyn, &provider, &rule_policy,
                                             app.session_id,
                                         )
                                         .await;
@@ -370,10 +397,10 @@ async fn run_tui() -> anyhow::Result<()> {
                             break;
                         }
                     }
+                    } // if !approval_handled
                 }
             }
         }
-
         // Drain agent events.
         while let Ok(ev) = events_rx.try_recv() {
             app.on_agent_event(ev);
@@ -399,6 +426,34 @@ fn bootstrap_agent_channel() -> mpsc::UnboundedReceiver<AgentEvent> {
     rx
 }
 
+/// Resolve the open approval dialog: record a session rule for "always",
+/// forward the answer to the runtime, and reflect the outcome in the UI.
+async fn answer_approval(
+    app: &mut App,
+    runtime: &Option<Arc<forge_core::runtime::Runtime>>,
+    rule_policy: &Arc<forge_core::permissions::RulePolicy>,
+    always: bool,
+    approved: bool,
+) {
+    let Some((call_id, tool, _command)) = app.take_pending_approval() else {
+        return;
+    };
+    if always && approved {
+        rule_policy.set_session_rule(&tool, forge_core::permissions::Rule::Allow);
+    }
+    if let Some(rt) = runtime {
+        rt.approve(&call_id, approved).await;
+    }
+    if approved {
+        app.status = "running…".into();
+    } else {
+        app.status = "denied".into();
+        app.push_line(app::Line::System(
+            "denied — the model sees the refusal and can adapt".into(),
+        ));
+    }
+}
+
 /// Build the agent. Returns the agent plus an optional user-facing
 /// warning: when the stored transcript cannot be read, persistence is
 /// disabled (session id dropped) so a later `replace_messages` can never
@@ -409,6 +464,7 @@ async fn build_agent(
     tools: &Registry<dyn forge_core::traits::Tool>,
     store: &Arc<dyn SessionStore>,
     provider: &Arc<dyn forge_core::traits::ModelProvider>,
+    policy: &Arc<forge_core::permissions::RulePolicy>,
     session_id: Option<uuid::Uuid>,
 ) -> (Arc<Agent>, Option<String>) {
     let mut context = ContextManager::new(cfg.context.clone());
@@ -490,7 +546,7 @@ async fn build_agent(
             provider: provider.clone(),
             tools: clone_registry(tools),
             store: store.clone(),
-            permissions: Arc::new(AllowAll),
+            permissions: policy.clone(),
             context: tokio::sync::Mutex::new(context),
             api_key: api_key.to_string(),
             model: cfg.model.name.clone(),
@@ -501,6 +557,10 @@ async fn build_agent(
             persisted_len: std::sync::atomic::AtomicUsize::new(ctx_len),
             history_replaced: std::sync::atomic::AtomicBool::new(false),
             persist_failed: std::sync::atomic::AtomicBool::new(false),
+            approval_gate: Arc::new(forge_core::approval::ApprovalGate::new()),
+            // Runtime::new flips this on; headless check runs without a
+            // runtime and therefore refuses `Ask` explicitly.
+            approvals_enabled: std::sync::atomic::AtomicBool::new(false),
         }),
         warning,
     )
@@ -630,6 +690,7 @@ mod tests {
             &test_tools(),
             &store,
             &test_provider(),
+            &Arc::new(forge_core::permissions::RulePolicy::from_config(&Default::default())),
             Some(uuid::Uuid::new_v4()),
         )
         .await;
@@ -725,6 +786,7 @@ mod tests {
             &test_tools(),
             &store_dyn,
             &test_provider(),
+            &Arc::new(forge_core::permissions::RulePolicy::from_config(&Default::default())),
             Some(sid),
         )
         .await;

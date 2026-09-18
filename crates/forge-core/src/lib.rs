@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_loop;
+pub mod approval;
 pub mod cancel;
 pub mod compact;
 pub mod config;
@@ -8,6 +9,7 @@ pub mod error;
 pub mod event;
 pub mod history;
 pub mod message;
+pub mod permissions;
 pub mod recovery;
 pub mod registry;
 pub mod runtime;

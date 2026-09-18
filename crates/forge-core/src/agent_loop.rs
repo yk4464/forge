@@ -28,6 +28,12 @@ pub struct Agent {
     pub max_tokens: u32,
     /// Per-turn budget limits and loop-detection threshold.
     pub budget: crate::config::BudgetConfig,
+    /// Approval gate for `Ask` decisions; the frontend answers through
+    /// `Runtime::approve` (S2).
+    pub approval_gate: Arc<crate::approval::ApprovalGate>,
+    /// Whether an approver is reachable. False in headless mode, where an
+    /// `Ask` is refused explicitly instead of waiting forever.
+    pub approvals_enabled: AtomicBool,
     /// Session id for persistence; None = ephemeral.
     pub session_id: Option<uuid::Uuid>,
     /// How many history items are already stored. Growth appends; a
@@ -276,30 +282,60 @@ impl Agent {
                 .await;
                 return Err(Error::BudgetExceeded(reason));
             }
-            if !self.permissions.approve(&call.name, &call.arguments).await {
-                let refusal = format!("Permission denied for tool {0}", call.name);
-                // Started/Completed must stay paired: UI consumers key
-                // completed cards off the started event.
-                send(AgentEvent::ToolCallStarted {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    command: args_json.clone(),
-                });
-                self.context.lock().await.push(Message::ToolResult {
-                    tool_call_id: call.id.clone(),
-                    content: refusal.clone(),
-                    is_error: true,
-                });
-                self.log_tool_finished(&call.id, crate::session::ToolEventState::Failed, &refusal)
+
+            // Permission gate (S2 §3): Ask parks the call until the
+            // frontend answers; headless mode refuses asks explicitly —
+            // never defaulting to allow. A refusal gets a recorded result
+            // (paired Started/Completed) instead of execution.
+            let may_execute = match self.permissions.approve(&call.name, &call.arguments).await {
+                crate::session::PermissionDecision::Allow => true,
+                crate::session::PermissionDecision::Ask => {
+                    let approved = if self.approvals_enabled.load(Ordering::SeqCst) {
+                        let call_id = call.id.clone();
+                        let tool = call.name.clone();
+                        let command = args_json.clone();
+                        self.approval_gate
+                            .request(&call_id, || {
+                                send(AgentEvent::ApprovalRequested {
+                                    call_id: call_id.clone(),
+                                    tool: tool.clone(),
+                                    command: command.clone(),
+                                });
+                            })
+                            .await
+                    } else {
+                        false
+                    };
+                    if approved {
+                        true
+                    } else if self.approvals_enabled.load(Ordering::SeqCst) {
+                        self.record_refusal(call, "Denied by user", events).await;
+                        false
+                    } else {
+                        self.record_refusal(
+                            call,
+                            &format!(
+                                "Permission for tool {0} requires approval, but no approver is \
+                                 available (headless mode); allow it explicitly in [permissions]",
+                                call.name
+                            ),
+                            events,
+                        )
+                        .await;
+                        false
+                    }
+                }
+                crate::session::PermissionDecision::Deny => {
+                    self.record_refusal(
+                        call,
+                        &format!("Permission denied for tool {0}", call.name),
+                        events,
+                    )
                     .await;
-                self.persist_state(Some(events)).await;
-                send(AgentEvent::ToolCallCompleted {
-                    call_id: call.id.clone(),
-                    exit_code: None,
-                    timed_out: false,
-                    duration_ms: 0,
-                    output: refusal,
-                });
+                    false
+                }
+            };
+            if !may_execute {
                 continue;
             }
 
@@ -434,10 +470,39 @@ impl Agent {
         Ok(None)
     }
 
+    /// Record a refused tool call: paired Started/Completed events, an
+    /// error result in history, and a failed entry in the execution log.
+    async fn record_refusal(
+        &self,
+        call: &ToolCall,
+        refusal: &str,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        let _ = events.send(AgentEvent::ToolCallStarted {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            command: call.arguments.to_string(),
+        });
+        self.context.lock().await.push(Message::ToolResult {
+            tool_call_id: call.id.clone(),
+            content: refusal.to_string(),
+            is_error: true,
+        });
+        self.log_tool_finished(&call.id, crate::session::ToolEventState::Failed, refusal)
+            .await;
+        self.persist_state(Some(events)).await;
+        let _ = events.send(AgentEvent::ToolCallCompleted {
+            call_id: call.id.clone(),
+            exit_code: None,
+            timed_out: false,
+            duration_ms: 0,
+            output: refusal.to_string(),
+        });
+    }
+
     /// Best-effort write of a terminal tool-execution record. Failures are
     /// logged: the recovery log is auxiliary to the transcript itself.
-    async fn log_tool_finished(&self, call_id: &str, state: crate::session::ToolEventState, output: &str) {
-        if let Some(sid) = self.session_id {
+    async fn log_tool_finished(&self, call_id: &str, state: crate::session::ToolEventState, output: &str) {        if let Some(sid) = self.session_id {
             if let Err(e) = self
                 .store
                 .record_tool_finished(sid, call_id, state, output)

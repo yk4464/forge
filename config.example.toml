@@ -40,3 +40,11 @@ max_turn_seconds = 900
 # 连续 N 次完全相同的工具调用（同工具同参数）或相同工具错误后停止本轮，
 # 防止失控循环；调大可容忍更长的正常轮询
 loop_threshold = 5
+
+[permissions]
+# 权限规则（S2）：allow = 直接放行；ask = 每次询问（TUI 内可选"本会话总是允许"）；
+# deny = 拒绝。未列出的工具：shell 默认 ask，其它默认 deny；
+# 无头模式（forge check）遇到 ask 一律明确拒绝——不默认放行。
+# default = "allow"
+[permissions.tools]
+# shell = "allow"

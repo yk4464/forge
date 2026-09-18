@@ -265,8 +265,12 @@ struct DenyAll;
 
 #[async_trait]
 impl forge_core::session::PermissionPolicy for DenyAll {
-    async fn approve(&self, _tool: &str, _args: &serde_json::Value) -> bool {
-        false
+    async fn approve(
+        &self,
+        _tool: &str,
+        _args: &serde_json::Value,
+    ) -> forge_core::session::PermissionDecision {
+        forge_core::session::PermissionDecision::Deny
     }
 }
 
@@ -297,6 +301,8 @@ fn test_agent(
         persisted_len: std::sync::atomic::AtomicUsize::new(0),
         history_replaced: std::sync::atomic::AtomicBool::new(false),
         persist_failed: std::sync::atomic::AtomicBool::new(false),
+        approval_gate: Arc::new(forge_core::approval::ApprovalGate::new()),
+        approvals_enabled: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -743,6 +749,147 @@ async fn persistence_is_append_mostly_and_failures_are_visible() {
         }
     }
     assert!(saw_warning, "storage failure must surface as a Warning");
+}
+
+#[tokio::test]
+async fn approval_ask_flow_allow_and_deny() {
+    // Rule policy: echo asks. Turn 0 requests one call; the test answers
+    // through the gate (allow), the tool runs. Turn 1 requests another;
+    // the answer is deny and the refusal lands in the transcript.
+    let script = |id: &'static str| {
+        Box::new(move || {
+            Ok(vec![
+                ProviderEvent::ToolCalls {
+                    calls: vec![ToolCall {
+                        id: id.to_string(),
+                        name: "echo".into(),
+                        arguments: serde_json::json!({"text": "x"}),
+                    }],
+                },
+                ProviderEvent::Done,
+            ])
+        }) as ScriptedTurn
+    };
+    // Script shape matters: each turn asks once and then gets a final
+    // answer (attempt 2), otherwise the second ask would sit unanswered.
+    let final_turn: ScriptedTurn = Box::new(|| {
+        Ok(vec![
+            ProviderEvent::MessageDelta { delta: "done".into() },
+            ProviderEvent::Done,
+        ])
+    });
+    let final_turn2: ScriptedTurn = Box::new(|| {
+        Ok(vec![
+            ProviderEvent::MessageDelta { delta: "done".into() },
+            ProviderEvent::Done,
+        ])
+    });
+    let mock = Arc::new(MockProvider::new(vec![
+        script("c_allow"),
+        final_turn,
+        script("c_deny"),
+        final_turn2,
+    ]));
+    let provider: Arc<dyn ModelProvider> = mock.clone();
+    let store: Arc<dyn SessionStore> = Arc::new(MemStore::default());
+    let mut pcfg = forge_core::config::PermissionConfig::default();
+    pcfg.tools.insert("echo".into(), "ask".into());
+    let agent = Arc::new(test_agent(provider, store, Arc::new(forge_core::permissions::RulePolicy::from_config(&pcfg)), None));
+    agent.approvals_enabled.store(true, Ordering::SeqCst);
+
+    // Turn 0: allow through the gate.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel0 = CancelHandle::default();
+    let runner = {
+        let agent = agent.clone();
+        let token = cancel0.token();
+        tokio::spawn(async move { agent.run_turn("go", tx, &token).await })
+    };
+    // Wait for the approval request, then answer.
+    let mut saw_request = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let mut answered = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ApprovalRequested { call_id, .. } = ev {
+                saw_request = true;
+                agent.approval_gate.respond(&call_id, true).await;
+                answered = true;
+            }
+        }
+        if answered {
+            break;
+        }
+    }
+    assert!(saw_request, "the ask must reach the frontend");
+    runner.await.unwrap().unwrap();
+
+    // Turn 1: deny through the gate; refusal becomes the tool result.
+    let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+    let cancel1 = CancelHandle::default();
+    let runner2 = {
+        let agent = agent.clone();
+        let token = cancel1.token();
+        tokio::spawn(async move { agent.run_turn("go again", tx2, &token).await })
+    };
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let mut answered = false;
+        while let Ok(ev) = rx2.try_recv() {
+            if let AgentEvent::ApprovalRequested { call_id, .. } = ev {
+                agent.approval_gate.respond(&call_id, false).await;
+                answered = true;
+            }
+        }
+        if answered {
+            break;
+        }
+    }
+    runner2.await.unwrap().unwrap();
+
+    let msgs = agent.context.lock().await.history.snapshot();
+    let allowed = msgs.iter().any(
+        |m| matches!(m, Message::ToolResult { tool_call_id, content, is_error: false }
+            if tool_call_id == "c_allow" && content.contains("echo: x")),
+    );
+    let refused = msgs.iter().any(
+        |m| matches!(m, Message::ToolResult { tool_call_id, content, is_error: true }
+            if tool_call_id == "c_deny" && content.contains("Denied by user")),
+    );
+    assert!(allowed, "approved call must have executed");
+    assert!(refused, "denied call must carry the refusal");
+}
+
+#[tokio::test]
+async fn headless_mode_refuses_ask_explicitly() {
+    // approvals_enabled stays false (no runtime attached): the ask is
+    // refused with a clear message instead of waiting or allowing.
+    let mock = Arc::new(MockProvider::new(vec![Box::new(|| {
+        Ok(vec![
+            ProviderEvent::ToolCalls {
+                calls: vec![ToolCall { id: "c1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "x"}) }],
+            },
+            ProviderEvent::Done,
+        ])
+    })]));
+    let provider: Arc<dyn ModelProvider> = mock;
+    let store: Arc<dyn SessionStore> = Arc::new(MemStore::default());
+    let mut pcfg = forge_core::config::PermissionConfig::default();
+    pcfg.tools.insert("echo".into(), "ask".into());
+    let agent = Arc::new(test_agent(provider, store, Arc::new(forge_core::permissions::RulePolicy::from_config(&pcfg)), None));
+    // approvals_enabled NOT enabled.
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn("go", tx, &CancelHandle::default().token())
+        .await
+        .unwrap();
+    let msgs = agent.context.lock().await.history.snapshot();
+    assert!(
+        msgs.iter().any(|m| matches!(m, Message::ToolResult { content, is_error: true, .. }
+            if content.contains("no approver is available"))),
+        "headless ask must be refused explicitly: {msgs:?}"
+    );
 }
 
 #[tokio::test]

@@ -19,6 +19,11 @@ pub enum AgentEvent {
     /// Live chunk of tool output (stdout/stderr merged), for incremental UI.
     ToolCallOutputDelta { call_id: String, chunk: String },
 
+    /// The tool call needs user approval before it may run. The UI answers
+    /// via `Runtime::approve(call_id, approved)` (optionally promoting the
+    /// tool to a session rule first); the turn blocks until then.
+    ApprovalRequested { call_id: String, tool: String, command: String },
+
     /// Tool finished. `output` is the final (possibly truncated) merged text.
     ToolCallCompleted {
         call_id: String,
