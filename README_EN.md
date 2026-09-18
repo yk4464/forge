@@ -64,10 +64,10 @@ See [config.example.toml](config.example.toml) — every field is commented: pro
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for the full feature map, dependencies, implementation order, and acceptance criteria. These stages do not promise calendar dates. v0.1.0 provides the agent loop, TUI, three protocols, SQLite, context compaction, and turn cancellation; the S0 baseline fixes were completed on 2026-09-19 and S1 is underway.
+See [ROADMAP.md](ROADMAP.md) for the full feature map, dependencies, implementation order, and acceptance criteria. These stages do not promise calendar dates. v0.2.0 provides the agent loop, TUI, three protocols, SQLite, context compaction, turn cancellation, per-turn budgets, and crash recovery; S0 and S1 are both complete (2026-09-19) and S2 is underway.
 
 - [x] **S0 Baseline fixes**: shell streaming and memory bounds, error completion, compaction message integrity (completed 2026-09-19)
-- [ ] **S1 Runtime and data reliability**: cancellation, original records, crash recovery, task budgets, runtime interfaces
+- [x] **S1 Runtime and data reliability**: cancellation, original records, crash recovery, task budgets, runtime interfaces (completed 2026-09-19)
 - [ ] **S2 Safe coding workflow**: permissions and workspace boundaries, file tools, project rules, planning and rewind
 - [ ] **S3 Daily usability**: Provider recovery, sessions and TUI, context and usage, scripting interface, basic release packages
 - [ ] **S4 Extension ecosystem**: Skills, MCP, Hooks, background tasks, and web tools

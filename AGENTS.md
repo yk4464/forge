@@ -2,10 +2,11 @@
 
 ## 项目定位
 
-forge：Rust 编写的流式优先终端编程 Agent（v0.1.0）。单一 shell 工具，
+forge：Rust 编写的流式优先终端编程 Agent（v0.2.0）。单一 shell 工具，
 三个 LLM 协议面，Codex 风格上下文压缩，SQLite 会话持久化，Ratatui TUI。
-版本策略：每完成一个 ROADMAP 阶段 minor +1（当前 v0.1.0 = S0 完成 + S1 取消开工），
-阶段间修复 patch +1；变更记录在 `CHANGELOG.md`。
+版本策略：每完成一个 ROADMAP 阶段 minor +1（当前 v0.2.0 = S1 完成：
+取消/预算/追加持久化/执行日志恢复/运行接口），阶段间修复 patch +1；
+变更记录在 `CHANGELOG.md`。
 
 ## 结构（Cargo workspace，5 crates）
 
@@ -22,7 +23,7 @@ forge：Rust 编写的流式优先终端编程 Agent（v0.1.0）。单一 shell 
 
 ```bash
 cargo build --workspace          # 必须零警告
-cargo test --workspace           # 当前 90 个测试
+cargo test --workspace           # 当前 92 个测试
 cargo run -p forge-tui           # 跑 TUI
 target/debug/forge check "..."   # 无头验收（复用 check 会话）
 ```
