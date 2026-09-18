@@ -1,0 +1,27 @@
+# forge 配置示例 — 复制为 config.toml 并填入你的厂商信息
+# 放在项目根目录（D:\agent\config.toml）或 ~/.forge/config.toml
+
+[provider]
+# 协议面：M1 支持 "openai"（/v1/chat/completions，兼容 DeepSeek/智谱/通义等）
+protocol = "openai"
+# base_url（带不带 /v1 都可以）
+base_url = "https://api.deepseek.com"
+# 从哪个环境变量读 API key
+api_key_env = "DEEPSEEK_API_KEY"
+
+[model]
+name = "deepseek-flash"
+# 可选：temperature = 0.7
+max_tokens = 8192
+
+[context]
+# 模型上下文窗口（token 数）
+context_window = 131072
+# 可选：显式自动压缩阈值（会被钳制到有效窗口的 90% 以内）
+# auto_compact_token_limit = 100000
+# shell 工具输出进入历史的字节上限（默认 1MiB）
+tool_output_max_bytes = 1048576
+# 可选：显式指定 bash.exe 路径（默认自动探测）
+# shell_path = "C:\\Program Files\\Git\\bin\\bash.exe"
+# shell 工具默认超时秒数（最大 600）
+shell_timeout_secs = 120

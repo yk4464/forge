@@ -1,0 +1,7 @@
+/target
+config.toml
+forge.toml
+.forge-logs/
+*.db
+*.db-shm
+*.db-wal
